@@ -60,6 +60,8 @@ fn setup(
     let asset = Address::generate(env);
     let collateral_asset = Address::generate(env);
     client.initialize(&admin, &1_000_000_000, &1000);
+    client.register_asset(&admin, &asset);
+    client.register_asset(&admin, &collateral_asset);
     (client, admin, user, asset, collateral_asset)
 }
 
@@ -95,9 +97,9 @@ fn test_max_liquidatable_zero_when_oracle_not_set() {
     // Without an oracle the health factor cannot be computed → must not liquidate.
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _admin, user, asset, collateral_asset) = setup(&env);
+    let (client, admin, user, asset, collateral_asset) = setup(&env);
     // Collateral 15_000, borrow 10_000 (150% ratio). Liquidation threshold 40% → HF < 1 when oracle exists.
-    client.set_liquidation_threshold_bps(&_admin, &4000);
+    client.set_liquidation_threshold_bps(&admin, &4000);
     client.borrow(&user, &asset, &10_000, &collateral_asset, &15_000);
     assert_eq!(client.get_max_liquidatable_amount(&user), 0);
 }
@@ -194,8 +196,6 @@ fn test_max_liquidatable_just_below_boundary_is_liquidatable() {
     env.mock_all_auths();
     let (client, admin, user, asset, collateral_asset) = setup_with_oracle(&env);
     client.set_liquidation_threshold_bps(&admin, &6667);
-    // Borrow 10_000 with 14_999 collateral — still passes 150% borrow rule? 14_999 < 15_000 → no.
-    // Use higher collateral to pass borrow rule but use a threshold that makes it sub-healthy.
     // threshold 4000: collateral 15_000, debt 10_000 → HF = 15_000*0.4*10000/10000 = 6000 < 10000.
     client.set_liquidation_threshold_bps(&admin, &4000);
     client.borrow(&user, &asset, &10_000, &collateral_asset, &15_000);

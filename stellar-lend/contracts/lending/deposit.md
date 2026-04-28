@@ -49,9 +49,10 @@ pub fn deposit(
 - Prevents integer overflow attacks
 
 ### Deposit Cap
-- Protocol enforces a maximum total deposit limit
-- Each deposit checks if new total would exceed cap
-- Protects protocol from excessive exposure
+- Protocol enforces a maximum total deposit limit per asset.
+- Each deposit (via `deposit`, `deposit_collateral`, or `token_receiver`) checks if the new total would exceed the cap.
+- Ensures consistent risk exposure management across all protocol entry points.
+- Protects the protocol from excessive exposure.
 
 ### Pause Mechanism
 - Admin can pause all deposit operations

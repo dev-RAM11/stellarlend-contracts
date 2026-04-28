@@ -72,27 +72,6 @@ pub fn ms_set_admins(
     Ok(())
 }
 
-/// Set the multisig approval threshold (admin only).
-pub fn set_ms_threshold(env: &Env, caller: Address, threshold: u32) -> Result<(), GovernanceError> {
-    // Authorization enforced via admin list check below.
-    let config = get_multisig_config(env).ok_or(GovernanceError::NotInitialized)?;
-    if !config.admins.contains(&caller) {
-        return Err(GovernanceError::Unauthorized);
-    }
-
-    if threshold == 0 || threshold > config.admins.len() as u32 {
-        return Err(GovernanceError::InvalidMultisigConfig);
-    }
-
-    let mut new_config = config;
-    new_config.threshold = threshold;
-
-    env.storage()
-        .instance()
-        .set(&GovernanceDataKey::MultisigConfig, &new_config);
-    Ok(())
-}
-
 /// Creates a proposal to update the minimum collateral ratio.
 ///
 /// The proposer must be a registered admin. Once created,
@@ -140,8 +119,8 @@ pub fn ms_propose_set_min_cr(
     let proposal_id = crate::governance::create_proposal(
         env,
         proposer.clone(),
-        proposal_type,
-        description,
+        ProposalType::MinCollateralRatio(new_ratio.try_into().unwrap()),
+        String::from_str(env, "Set Minimum Collateral Ratio"),
         None,
         Some(config.threshold), // Persist threshold at creation time
         None,
@@ -255,30 +234,4 @@ pub fn get_ms_proposal(env: &Env, proposal_id: u64) -> Option<Proposal> {
 /// Returns approvals for a specific proposal.
 pub fn get_ms_approvals(env: &Env, proposal_id: u64) -> Option<Vec<Address>> {
     get_proposal_approvals(env, proposal_id)
-}
-
-/// Set the multisig approval threshold (admin only).
-pub fn set_ms_threshold(env: &Env, caller: Address, threshold: u32) -> Result<(), GovernanceError> {
-    caller.require_auth();
-
-    if threshold == 0 {
-        return Err(GovernanceError::InvalidThreshold);
-    }
-
-    let config = get_multisig_config(env).ok_or(GovernanceError::NotInitialized)?;
-    if !config.admins.contains(&caller) {
-        return Err(GovernanceError::Unauthorized);
-    }
-
-    if threshold > config.admins.len() as u32 {
-        return Err(GovernanceError::InvalidThreshold);
-    }
-
-    let mut new_config = config;
-    new_config.threshold = threshold;
-
-    env.storage()
-        .instance()
-        .set(&GovernanceDataKey::MultisigConfig, &new_config);
-    Ok(())
 }

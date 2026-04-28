@@ -40,6 +40,8 @@ fn setup_stress_test(env: &Env) -> (LendingContractClient<'_>, Address, Address,
 
     // Initialize with high limits for stress testing
     client.initialize(&admin, &10_000_000_000, &100);
+    client.register_asset(&admin, &asset);
+    client.register_asset(&admin, &collateral_asset);
 
     (client, admin, asset, collateral_asset)
 }

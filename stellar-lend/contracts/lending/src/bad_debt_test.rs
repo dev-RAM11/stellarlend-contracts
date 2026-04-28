@@ -1,7 +1,18 @@
 #[cfg(test)]
 mod test {
     use crate::{LendingContract, LendingContractClient};
-    use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, Env};
+    use soroban_sdk::{contract, contractimpl, testutils::Address as _, testutils::Ledger as _, Address, Env};
+
+    /// Simple mock oracle returning a fixed price of 1.0 (100_000_000 with 8 decimals).
+    #[contract]
+    pub struct BadDebtMockOracle;
+
+    #[contractimpl]
+    impl BadDebtMockOracle {
+        pub fn price(_env: Env, _asset: Address) -> i128 {
+            100_000_000
+        }
+    }
 
     #[test]
     fn test_bad_debt_accounting_auto_offset() {
@@ -19,6 +30,17 @@ mod test {
 
         // Initialize protocol
         client.initialize(&admin, &1_000_000, &10);
+        client.register_asset(&admin, &asset);
+        client.register_asset(&admin, &collateral_asset);
+
+        // Set oracle so health factor can be computed
+        let oracle_id = env.register(BadDebtMockOracle, ());
+        client.set_oracle(&admin, &oracle_id);
+
+        // Set threshold=40% so position is under-water (collateral=150, debt=100 → HF=6_000)
+        client.set_liquidation_threshold_bps(&admin, &4000);
+        // Allow full close
+        client.set_close_factor_bps(&admin, &10_000);
 
         // 1. Credit Insurance Fund with 50 units
         client.credit_insurance_fund(&admin, &asset, &50);
@@ -41,7 +63,9 @@ mod test {
         assert_eq!(client.get_total_bad_debt(&asset), 0);
 
         // 3. Liquidate: Repay all debt (200), but only 150 collateral exists.
-        // Repay amount 200. Collateral 150. Shortfall = 50.
+        // With 0% incentive, seized = repay = 200, but capped at 150 → shortfall = 50.
+        // Set incentive to 0 so seized = repay (no bonus), making shortfall clear.
+        client.set_liquidation_incentive_bps(&admin, &0);
         client.liquidate(&liquidator, &borrower, &asset, &collateral_asset, &200);
 
         // 4. Verify Accounting
@@ -68,6 +92,15 @@ mod test {
 
         // Initialize protocol
         client.initialize(&admin, &1_000_000, &10);
+        client.register_asset(&admin, &asset);
+        client.register_asset(&admin, &collateral_asset);
+
+        // Set oracle and threshold so position is under-water
+        let oracle_id = env.register(BadDebtMockOracle, ());
+        client.set_oracle(&admin, &oracle_id);
+        client.set_liquidation_threshold_bps(&admin, &4000);
+        client.set_close_factor_bps(&admin, &10_000);
+        client.set_liquidation_incentive_bps(&admin, &0); // no bonus so shortfall is clear
 
         // 1. Credit Insurance Fund with 10 units
         client.credit_insurance_fund(&admin, &asset, &10);

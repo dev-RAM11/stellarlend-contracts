@@ -41,6 +41,8 @@ pub fn receive(
     amount: i128,
     payload: Vec<Val>,
 ) -> Result<(), BorrowError> {
+    crate::asset_registry::require_registered_asset(&env, &token_asset)?;
+
     if amount <= 0 {
         return Err(BorrowError::InvalidAmount);
     }

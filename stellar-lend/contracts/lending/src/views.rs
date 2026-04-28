@@ -8,6 +8,13 @@
 //! - View functions do not modify contract or user state.
 //! - Collateral and debt values depend on the oracle; ensure the oracle is correct and trusted.
 //! - Health factor uses the admin-set liquidation threshold consistently.
+//!
+//! ## Serialization Stability
+//! Public getter structs are treated as view schema `v1`.
+//! Soroban `#[contracttype]` structs serialize as XDR maps keyed by field name, and the generated
+//! conversion code sorts those keys lexicographically. Existing getter return structs must keep
+//! their current field names and types stable; any additive or breaking change should ship as a
+//! new versioned getter/type instead of mutating the existing schema in place.
 
 use crate::borrow::{
     get_close_factor_bps, get_liquidation_incentive_bps, get_liquidation_threshold_bps, get_oracle,
@@ -26,10 +33,15 @@ pub const HEALTH_FACTOR_SCALE: i128 = BPS_SCALE;
 /// Sentinel health factor when user has no debt (position is healthy).
 pub const HEALTH_FACTOR_NO_DEBT: i128 = 100_000_000;
 
+/// Current schema version for public getter structs documented in this contract.
+pub const VIEW_SCHEMA_VERSION: u32 = 1;
+
 /// Summary of a user's borrow position for frontends and liquidations.
 ///
 /// All value fields use a common unit (e.g. USD with 8 decimals) when oracle is set.
 /// When oracle is not set, `collateral_value` and `debt_value` are 0 and `health_factor` is 0.
+/// Serialization contract: this struct is exposed as view schema `v1`. Preserve the current field
+/// names and types for `get_user_position`; ship a new versioned getter/type for any schema change.
 #[contracttype]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UserPositionSummary {
@@ -235,12 +247,39 @@ pub fn get_health_factor(env: &Env, user: &Address) -> i128 {
 
 /// Returns the maximum debt amount that can be liquidated for `user` in one call.
 ///
-/// Returns 0 when:
-/// - User has no debt
-/// - Position is healthy (health factor ≥ 1.0, i.e. ≥ `HEALTH_FACTOR_SCALE`)
-/// - Oracle is not configured (health factor cannot be computed)
+/// This is the primary view function for liquidation bots and frontends to determine
+/// how much of a borrower's debt can be repaid in a single `liquidate` call.
+/// The value is consistent with the close-factor cap enforced inside `liquidate_position`.
 ///
-/// Formula: `total_debt * close_factor_bps / 10000`
+/// ## Returns 0 when
+/// - User has no outstanding debt (`borrowed_amount + interest_accrued == 0`)
+/// - Position is healthy (health factor ≥ `HEALTH_FACTOR_SCALE`, i.e. ≥ 1.0)
+/// - Oracle is not configured or returns no fresh price (health factor cannot be computed)
+///
+/// ## Formula
+/// ```text
+/// total_debt  = borrowed_amount + interest_accrued
+/// max_liq     = floor(total_debt * close_factor_bps / 10_000)
+/// ```
+///
+/// ## Rounding and unit scales
+/// - All amounts are in raw token units (no decimal assumption by the contract).
+/// - Oracle price uses 8-decimal fixed-point: `100_000_000 = 1.0`.
+/// - BPS scale: `10_000 = 100%`.
+/// - Division is integer floor: `floor(10_001 * 5_000 / 10_000) = 5_000`, not 5_000.5.
+/// - Interest accrual in `borrow.rs` uses ceiling-up rounding; the stored
+///   `interest_accrued` field already reflects that rounding before this view reads it.
+///
+/// ## Consistency with `liquidate`
+/// `liquidate_position` calls this function internally to derive the close-factor cap,
+/// so the value returned here is exactly the amount that will be repaid when
+/// `liquidate` is called with an amount larger than the cap.
+///
+/// ## Cross-asset positions
+/// This function reads only the simplified single-asset borrow position
+/// (`get_user_debt` / `get_user_collateral`). Cross-asset positions tracked by
+/// the `cross_asset` module are not reflected here; use `get_cross_position_summary`
+/// for those.
 ///
 /// # Security
 /// Read-only; no state change. Relies on oracle for health factor; 0 is returned

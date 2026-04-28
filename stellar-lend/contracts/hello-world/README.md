@@ -22,6 +22,10 @@ This contract exposes the core API for StellarLend, including lending/borrowing,
 
 Refer to `src/lib.rs` for detailed types and events.
 
+## Developer Resources
+
+- **[Developer Glossary](../../../docs/glossary.md)**: Key protocol terms, numeric scales, and common pitfalls for integrators.
+
 ## Security Notes
 
 - Reentrancy guarantees and Soroban execution-model assumptions are documented in [`REENTRANCY.md`](./REENTRANCY.md).

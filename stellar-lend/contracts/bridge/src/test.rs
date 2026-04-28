@@ -1,5 +1,5 @@
 use crate::bridge::*;
-use soroban_sdk::{testutils::Address as _, Address, Env, String};
+use soroban_sdk::{testutils::Address as _, Address, BytesN, Env, String};
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
@@ -15,6 +15,12 @@ fn setup() -> (Env, BridgeContractClient<'static>, Address) {
 
 fn s(env: &Env, v: &str) -> String {
     String::from_str(env, v)
+}
+
+fn msg(env: &Env, seed: u8) -> BytesN<32> {
+    let mut bytes = [0u8; 32];
+    bytes[0] = seed;
+    BytesN::from_array(env, &bytes)
 }
 
 /// Register the default "eth-mainnet" bridge (fee_bps=50, min_amount=1_000, network_id=1).
@@ -251,7 +257,7 @@ fn inactive_bridge_still_allows_withdrawals() {
     client.set_bridge_active(&admin, &s(&env, "eth-mainnet"), &false);
     let recip = Address::generate(&env);
     // withdrawal must succeed even though bridge is inactive
-    client.bridge_withdraw(&admin, &s(&env, "eth-mainnet"), &recip, &5_000i128);
+    client.bridge_withdraw(&admin, &s(&env, "eth-mainnet"), &msg(&env, 15), &recip, &5_000i128);
     assert_eq!(
         client
             .get_bridge_config(&s(&env, "eth-mainnet"))
@@ -373,7 +379,7 @@ fn withdraw_accumulates_total_withdrawn() {
     let (env, client, admin) = setup();
     default_bridge(&client, &env, &admin);
     let recip = Address::generate(&env);
-    client.bridge_withdraw(&admin, &s(&env, "eth-mainnet"), &recip, &40_000i128);
+    client.bridge_withdraw(&admin, &s(&env, "eth-mainnet"), &msg(&env, 1), &recip, &40_000i128);
     assert_eq!(
         client
             .get_bridge_config(&s(&env, "eth-mainnet"))
@@ -387,8 +393,8 @@ fn withdraw_multiple_accumulates_correctly() {
     let (env, client, admin) = setup();
     default_bridge(&client, &env, &admin);
     let recip = Address::generate(&env);
-    client.bridge_withdraw(&admin, &s(&env, "eth-mainnet"), &recip, &10_000i128);
-    client.bridge_withdraw(&admin, &s(&env, "eth-mainnet"), &recip, &20_000i128);
+    client.bridge_withdraw(&admin, &s(&env, "eth-mainnet"), &msg(&env, 2), &recip, &10_000i128);
+    client.bridge_withdraw(&admin, &s(&env, "eth-mainnet"), &msg(&env, 3), &recip, &20_000i128);
     assert_eq!(
         client
             .get_bridge_config(&s(&env, "eth-mainnet"))
@@ -404,7 +410,7 @@ fn withdraw_non_admin_panics() {
     default_bridge(&client, &env, &admin);
     let rando = Address::generate(&env);
     let recip = Address::generate(&env);
-    client.bridge_withdraw(&rando, &s(&env, "eth-mainnet"), &recip, &5_000i128);
+    client.bridge_withdraw(&rando, &s(&env, "eth-mainnet"), &msg(&env, 4), &recip, &5_000i128);
 }
 
 #[test]
@@ -413,7 +419,7 @@ fn withdraw_zero_amount_panics() {
     let (env, client, admin) = setup();
     default_bridge(&client, &env, &admin);
     let recip = Address::generate(&env);
-    client.bridge_withdraw(&admin, &s(&env, "eth-mainnet"), &recip, &0i128);
+    client.bridge_withdraw(&admin, &s(&env, "eth-mainnet"), &msg(&env, 5), &recip, &0i128);
 }
 
 #[test]
@@ -422,7 +428,7 @@ fn withdraw_below_minimum_panics() {
     let (env, client, admin) = setup();
     default_bridge(&client, &env, &admin); // min=1_000
     let recip = Address::generate(&env);
-    client.bridge_withdraw(&admin, &s(&env, "eth-mainnet"), &recip, &500i128);
+    client.bridge_withdraw(&admin, &s(&env, "eth-mainnet"), &msg(&env, 6), &recip, &500i128);
 }
 
 #[test]
@@ -430,7 +436,7 @@ fn withdraw_below_minimum_panics() {
 fn withdraw_unknown_bridge_panics() {
     let (env, client, admin) = setup();
     let recip = Address::generate(&env);
-    client.bridge_withdraw(&admin, &s(&env, "ghost"), &recip, &5_000i128);
+    client.bridge_withdraw(&admin, &s(&env, "ghost"), &msg(&env, 7), &recip, &5_000i128);
 }
 
 // ── relayer role ───────────────────────────────────────────────────────────────
@@ -452,7 +458,7 @@ fn relayer_can_withdraw() {
     client.set_relayer(&admin, &relayer);
     let recip = Address::generate(&env);
     // relayer (not admin) executes the withdrawal
-    client.bridge_withdraw(&relayer, &s(&env, "eth-mainnet"), &recip, &5_000i128);
+    client.bridge_withdraw(&relayer, &s(&env, "eth-mainnet"), &msg(&env, 8), &recip, &5_000i128);
     assert_eq!(
         client
             .get_bridge_config(&s(&env, "eth-mainnet"))
@@ -499,7 +505,7 @@ fn admin_can_still_withdraw_when_relayer_is_set() {
     client.set_relayer(&admin, &relayer);
     let recip = Address::generate(&env);
     // Admin retains withdrawal rights even after a relayer is designated
-    client.bridge_withdraw(&admin, &s(&env, "eth-mainnet"), &recip, &5_000i128);
+    client.bridge_withdraw(&admin, &s(&env, "eth-mainnet"), &msg(&env, 9), &recip, &5_000i128);
 }
 
 #[test]
@@ -513,7 +519,48 @@ fn old_relayer_cannot_withdraw_after_relayer_updated() {
     client.set_relayer(&admin, &relayer2);
     // relayer1 is no longer authorised
     let recip = Address::generate(&env);
-    client.bridge_withdraw(&relayer1, &s(&env, "eth-mainnet"), &recip, &5_000i128);
+    client.bridge_withdraw(&relayer1, &s(&env, "eth-mainnet"), &msg(&env, 10), &recip, &5_000i128);
+}
+
+#[test]
+fn withdraw_marks_message_id_processed() {
+    let (env, client, admin) = setup();
+    default_bridge(&client, &env, &admin);
+    let message_id = msg(&env, 11);
+    let recip = Address::generate(&env);
+
+    assert!(!client.is_withdrawal_processed(&message_id));
+    client.bridge_withdraw(&admin, &s(&env, "eth-mainnet"), &message_id, &recip, &5_000i128);
+    assert!(client.is_withdrawal_processed(&message_id));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn withdraw_replay_with_same_message_id_panics() {
+    let (env, client, admin) = setup();
+    default_bridge(&client, &env, &admin);
+    let message_id = msg(&env, 12);
+    let recip = Address::generate(&env);
+
+    client.bridge_withdraw(&admin, &s(&env, "eth-mainnet"), &message_id, &recip, &5_000i128);
+    client.bridge_withdraw(&admin, &s(&env, "eth-mainnet"), &message_id, &recip, &5_000i128);
+}
+
+#[test]
+fn withdraw_same_payload_with_distinct_message_ids_succeeds() {
+    let (env, client, admin) = setup();
+    default_bridge(&client, &env, &admin);
+    let recip = Address::generate(&env);
+
+    client.bridge_withdraw(&admin, &s(&env, "eth-mainnet"), &msg(&env, 13), &recip, &5_000i128);
+    client.bridge_withdraw(&admin, &s(&env, "eth-mainnet"), &msg(&env, 14), &recip, &5_000i128);
+
+    assert_eq!(
+        client
+            .get_bridge_config(&s(&env, "eth-mainnet"))
+            .total_withdrawn,
+        10_000
+    );
 }
 
 // ── list_bridges ───────────────────────────────────────────────────────────────
@@ -593,6 +640,13 @@ fn compute_fee_rounds_down() {
     let env = Env::default();
     // 999 * 10 / 10_000 = 0.999 → rounds to 0
     assert_eq!(BridgeContract::compute_fee(env, 999, 10), 0);
+}
+
+#[test]
+fn compute_fee_rounding_boundary_changes_at_expected_threshold() {
+    let env = Env::default();
+    assert_eq!(BridgeContract::compute_fee(env.clone(), 199, 50), 0);
+    assert_eq!(BridgeContract::compute_fee(env, 200, 50), 1);
 }
 
 #[test]

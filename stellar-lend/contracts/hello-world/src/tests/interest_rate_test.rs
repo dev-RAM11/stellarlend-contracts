@@ -283,15 +283,27 @@ fn test_emergency_rate_adjustment_exceeds_bounds() {
     client.set_emergency_rate_adjustment(&admin, &15000);
 }
 
-/// Extreme negative emergency cannot push below floor
+/// Ensure emergency adjustments cannot exceed MAX_RATE_CHANGE_BPS
 #[test]
-fn test_borrow_rate_clamped_at_floor_under_extreme_negative_adjustment() {
+#[should_panic(expected = "HostError")]
+fn test_emergency_adjustment_exceeds_rate_limit() {
     let env = create_test_env();
     let (contract_id, admin, client) = setup_contract_with_admin(&env);
     set_protocol_analytics(&env, &contract_id, 10_000, 0);
-    client.set_emergency_rate_adjustment(&admin, &-10_000);
-    let borrow_rate = client.get_borrow_rate();
-    assert_eq!(borrow_rate, 50); // floor
+    // 501 exceeds MAX_RATE_CHANGE_BPS (500)
+    client.set_emergency_rate_adjustment(&admin, &501);
+}
+
+#[test]
+fn test_emergency_adjustment_at_rate_limit() {
+    let env = create_test_env();
+    let (contract_id, admin, client) = setup_contract_with_admin(&env);
+    set_protocol_analytics(&env, &contract_id, 10_000, 0);
+    let rate_before = client.get_borrow_rate();
+    // Exactly at MAX_RATE_CHANGE_BPS should succeed
+    client.set_emergency_rate_adjustment(&admin, &500);
+    let rate_after = client.get_borrow_rate();
+    assert_eq!(rate_after, rate_before + 500);
 }
 
 // =============================================================================
@@ -788,29 +800,23 @@ fn test_compound_interest_long_horizon_no_overflow() {
 // =============================================================================
 
 #[test]
-fn test_borrow_rate_clamped_at_ceiling_under_extreme_configuration() {
+#[should_panic(expected = "HostError")]
+fn test_config_update_exceeds_rate_limit() {
     let env = create_test_env();
     let (contract_id, admin, client) = setup_contract_with_admin(&env);
     set_protocol_analytics(&env, &contract_id, 10_000, 20_000);
 
+    // Initial base rate is 100. Jumping to 1000 would increase rate by 900 > 500
     client.update_interest_rate_config(
         &admin,
-        &Some(10_000),
-        &Some(1),
-        &Some(100_000),
-        &Some(100_000),
-        &Some(50),
-        &Some(10_000),
-        &Some(200),
+        &Some(1000),
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
+        &None,
     );
-    client.set_emergency_rate_adjustment(&admin, &10_000);
-
-    let borrow_rate = client.get_borrow_rate();
-    let supply_rate = client.get_supply_rate();
-
-    assert_eq!(borrow_rate, 10_000); // ceiling
-    assert!(supply_rate >= 50);
-    assert!(supply_rate <= 10_000);
 }
 
 // =============================================================================

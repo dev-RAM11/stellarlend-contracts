@@ -743,10 +743,347 @@ fn test_upgrade_with_single_approver_required() {
 
     // Admin proposes — auto-approved (admin is in approvers set)
     let p1 = client.upgrade_propose(&admin, &hash(&env, 2), &1);
-    assert_eq!(
-        client.upgrade_status(&p1).stage,
-        UpgradeStage::Approved
-    );
+    assert_eq!(client.upgrade_status(&p1).stage, UpgradeStage::Approved);
     client.upgrade_execute(&admin, &p1);
     assert_eq!(client.current_version(), 1);
+}
+
+// ═══════════════════════════════════════════════════════
+// 11. User position preservation across storage layout additions (#681)
+//
+// These tests model the realistic upgrade scenario where a new contract
+// version introduces additional storage keys/fields (e.g. a new per-user
+// rate field, an extra timestamp, or a brand-new namespaced map). The
+// existing user state — collateral, debt, rates, timestamps — must be
+// preserved byte-for-byte while the new fields layer on top without
+// touching legacy entries.
+//
+// Approach
+// --------
+// Soroban tests cannot literally swap struct definitions mid-run, so we
+// emulate a layout addition by:
+//   1. Seeding rich, multi-field per-user records under the existing
+//      data_store namespace (the encoded "old layout").
+//   2. Performing the upgrade.
+//   3. After upgrade, *adding* new storage keys for the same users
+//      under fresh, non-overlapping namespaces (the "new layout").
+//   4. Asserting that every legacy field is preserved verbatim and that
+//      the freshly added entries coexist with — never overwrite — the
+//      old ones.
+//
+// Security note
+// -------------
+// State integrity under upgrades is a load-bearing protocol invariant.
+// A migration that silently mutates or drops user positions would let
+// an attacker (or buggy migration) socialise losses across borrowers.
+// These tests pin the contract's behaviour: legacy entries survive
+// upgrades unchanged, and new keys never alias old ones.
+// ═══════════════════════════════════════════════════════
+
+/// Encode a synthetic per-user position (collateral, debt, rate, timestamp)
+/// into a deterministic byte payload. We use an explicit layout so that any
+/// re-ordering or truncation during a migration would be detectable.
+fn encode_position(env: &Env, collateral: i128, debt: i128, rate_bps: u32, ts: u64) -> soroban_sdk::Bytes {
+    let mut buf = [0u8; 40];
+    buf[0..16].copy_from_slice(&collateral.to_be_bytes());
+    buf[16..32].copy_from_slice(&debt.to_be_bytes());
+    buf[32..36].copy_from_slice(&rate_bps.to_be_bytes());
+    buf[36..40].copy_from_slice(&(ts as u32).to_be_bytes());
+    soroban_sdk::Bytes::from_slice(env, &buf)
+}
+
+/// Seed a portfolio of positions for `n` users across `m` synthetic assets.
+/// Each (user, asset) record is keyed as `pos_v1::{user_idx}::{asset_idx}`
+/// so the layout is unambiguous when later compared against the
+/// post-upgrade snapshot.
+fn seed_multi_asset_positions(
+    env: &Env,
+    client: &LendingContractClient,
+    admin: &Address,
+    n_users: usize,
+    n_assets: usize,
+) -> Vec<(SorobanString, soroban_sdk::Bytes)> {
+    client.data_store_init(admin);
+    let mut entries: Vec<(SorobanString, soroban_sdk::Bytes)> = Vec::new();
+    for u in 0..n_users {
+        for a in 0..n_assets {
+            // Deterministic but distinct values per (user, asset)
+            let collateral = ((u + 1) as i128) * 10_000 + (a as i128) * 17;
+            let debt = ((u + 1) as i128) * 4_000 + (a as i128) * 11;
+            let rate_bps = 250u32 + (a as u32) * 25;
+            let ts = 1_700_000_000u64 + (u as u64) * 3600 + (a as u64) * 60;
+            let key = SorobanString::from_str(env, &format!("pos_v1_{u}_{a}"));
+            let val = encode_position(env, collateral, debt, rate_bps, ts);
+            client.data_save(admin, &key, &val);
+            entries.push((key, val));
+        }
+    }
+    entries
+}
+
+#[test]
+fn test_positions_preserved_across_upgrade_layout_addition() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin) = setup_with_upgrade_init(&env, 1);
+
+    // 1. Seed multi-asset positions in the "old" layout
+    let entries = seed_multi_asset_positions(&env, &client, &admin, 4, 3);
+    let pre_count = client.data_entry_count();
+    assert_eq!(pre_count, 12);
+
+    // 2. Snapshot every value before the upgrade
+    let pre_snapshot: Vec<soroban_sdk::Bytes> =
+        entries.iter().map(|(k, _)| client.data_load(k)).collect();
+
+    // 3. Execute upgrade and bump schema version (simulates new layout)
+    let proposal = client.upgrade_propose(&admin, &hash(&env, 2), &1);
+    client.upgrade_execute(&admin, &proposal);
+    let memo = SorobanString::from_str(&env, "add_per_asset_rate_field");
+    client.data_migrate_bump_version(&admin, &1, &memo);
+
+    // 4. Every legacy entry must round-trip exactly
+    for ((key, expected), pre) in entries.iter().zip(pre_snapshot.iter()) {
+        let post = client.data_load(key);
+        assert_eq!(&post, expected, "post-upgrade value differs from seeded value");
+        assert_eq!(&post, pre, "post-upgrade value differs from pre-upgrade snapshot");
+    }
+    assert_eq!(client.data_entry_count(), pre_count);
+    assert_eq!(client.data_schema_version(), 1);
+}
+
+#[test]
+fn test_new_storage_fields_coexist_with_preserved_positions() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin) = setup_with_upgrade_init(&env, 1);
+
+    let entries = seed_multi_asset_positions(&env, &client, &admin, 3, 2);
+    let pre_count = client.data_entry_count();
+
+    // Upgrade then bump schema (v0 → v1 layout)
+    let p1 = client.upgrade_propose(&admin, &hash(&env, 2), &1);
+    client.upgrade_execute(&admin, &p1);
+    let memo = SorobanString::from_str(&env, "v1_layout_add_health_score");
+    client.data_migrate_bump_version(&admin, &1, &memo);
+
+    // Add brand-new keys under a fresh namespace ("v1_meta_") for every legacy
+    // (user, asset) pair. These represent the newly added storage fields.
+    for u in 0..3usize {
+        for a in 0..2usize {
+            let new_key = SorobanString::from_str(&env, &format!("v1_meta_{u}_{a}"));
+            let new_val =
+                soroban_sdk::Bytes::from_slice(&env, &[(u * 2 + a + 1) as u8; 24]);
+            client.data_save(&admin, &new_key, &new_val);
+        }
+    }
+
+    // Legacy entries must remain untouched
+    for (key, expected) in entries.iter() {
+        assert_eq!(&client.data_load(key), expected);
+    }
+
+    // New entries must be readable and distinct from legacy ones
+    for u in 0..3usize {
+        for a in 0..2usize {
+            let new_key = SorobanString::from_str(&env, &format!("v1_meta_{u}_{a}"));
+            let expected =
+                soroban_sdk::Bytes::from_slice(&env, &[(u * 2 + a + 1) as u8; 24]);
+            assert_eq!(client.data_load(&new_key), expected);
+        }
+    }
+
+    assert_eq!(client.data_entry_count(), pre_count + 6);
+}
+
+#[test]
+fn test_position_decoding_after_upgrade_round_trip() {
+    // Asserts that every encoded field (collateral, debt, rate, timestamp)
+    // survives the upgrade with bit-identical fidelity. This catches
+    // off-by-one truncation, byte-order flips, or accidental zeroing
+    // during a migration.
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin) = setup_with_upgrade_init(&env, 1);
+    client.data_store_init(&admin);
+
+    // A handful of explicit, edge-case positions
+    let cases: [(i128, i128, u32, u64); 5] = [
+        (1, 1, 1, 1),
+        (i128::MAX / 2, i128::MAX / 4, 9_999, 1_700_000_000),
+        (10_000_000_000_000, 5_000_000_000_000, 0, 0),
+        (123_456_789, 987_654_321, 7_500, 4_294_967_290),
+        (0, 0, 10_000, 1),
+    ];
+
+    let mut keys: Vec<SorobanString> = Vec::new();
+    for (i, (c, d, r, t)) in cases.iter().enumerate() {
+        let k = SorobanString::from_str(&env, &format!("edge_pos_{i}"));
+        client.data_save(&admin, &k, &encode_position(&env, *c, *d, *r, *t));
+        keys.push(k);
+    }
+
+    // Upgrade and bump schema
+    let p1 = client.upgrade_propose(&admin, &hash(&env, 2), &1);
+    client.upgrade_execute(&admin, &p1);
+    client.data_migrate_bump_version(
+        &admin,
+        &1,
+        &SorobanString::from_str(&env, "v1_decode_check"),
+    );
+
+    // Decode each entry post-upgrade and assert exact field-level equality
+    for (k, (c, d, r, t)) in keys.iter().zip(cases.iter()) {
+        let bytes = client.data_load(k);
+        let mut buf = [0u8; 40];
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = bytes.get(i as u32).expect("byte present");
+        }
+        let collateral = i128::from_be_bytes(buf[0..16].try_into().unwrap());
+        let debt = i128::from_be_bytes(buf[16..32].try_into().unwrap());
+        let rate = u32::from_be_bytes(buf[32..36].try_into().unwrap());
+        let ts = u32::from_be_bytes(buf[36..40].try_into().unwrap()) as u64;
+        assert_eq!(collateral, *c, "collateral mismatch after upgrade");
+        assert_eq!(debt, *d, "debt mismatch after upgrade");
+        assert_eq!(rate, *r, "rate_bps mismatch after upgrade");
+        assert_eq!(ts, *t, "timestamp mismatch after upgrade");
+    }
+}
+
+#[test]
+fn test_positions_preserved_across_sequential_layout_additions() {
+    // Three sequential upgrades, each simulating a new storage field
+    // layered on top. The original seeded positions must remain intact
+    // after every upgrade step, never overwritten by the additive
+    // migration writes.
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin) = setup_with_upgrade_init(&env, 1);
+
+    let entries = seed_multi_asset_positions(&env, &client, &admin, 2, 4);
+    let baseline_count = client.data_entry_count();
+
+    // v0 → v1: add per-position health score
+    let p1 = client.upgrade_propose(&admin, &hash(&env, 2), &1);
+    client.upgrade_execute(&admin, &p1);
+    client.data_migrate_bump_version(
+        &admin,
+        &1,
+        &SorobanString::from_str(&env, "v1_health_score"),
+    );
+    for (i, (key, expected)) in entries.iter().enumerate() {
+        assert_eq!(&client.data_load(key), expected);
+        let new_k = SorobanString::from_str(&env, &format!("v1_hs_{i}"));
+        client.data_save(&admin, &new_k, &soroban_sdk::Bytes::from_slice(&env, &[1u8; 4]));
+    }
+
+    // v1 → v2: add per-position last-accrual timestamp
+    let p2 = client.upgrade_propose(&admin, &hash(&env, 3), &2);
+    client.upgrade_execute(&admin, &p2);
+    client.data_migrate_bump_version(
+        &admin,
+        &2,
+        &SorobanString::from_str(&env, "v2_last_accrual"),
+    );
+    for (i, (key, expected)) in entries.iter().enumerate() {
+        assert_eq!(&client.data_load(key), expected);
+        let new_k = SorobanString::from_str(&env, &format!("v2_acc_{i}"));
+        client.data_save(&admin, &new_k, &soroban_sdk::Bytes::from_slice(&env, &[2u8; 8]));
+    }
+
+    // v2 → v3: add per-position liquidation flag
+    let p3 = client.upgrade_propose(&admin, &hash(&env, 4), &3);
+    client.upgrade_execute(&admin, &p3);
+    client.data_migrate_bump_version(
+        &admin,
+        &3,
+        &SorobanString::from_str(&env, "v3_liq_flag"),
+    );
+    for (i, (key, expected)) in entries.iter().enumerate() {
+        assert_eq!(&client.data_load(key), expected);
+        let new_k = SorobanString::from_str(&env, &format!("v3_flag_{i}"));
+        client.data_save(&admin, &new_k, &soroban_sdk::Bytes::from_slice(&env, &[0xFFu8; 1]));
+    }
+
+    // Original entries are still present and unchanged
+    for (key, expected) in entries.iter() {
+        assert_eq!(&client.data_load(key), expected);
+    }
+
+    // Final layout: 8 originals + 8 (v1) + 8 (v2) + 8 (v3) = 32 entries
+    assert_eq!(client.data_entry_count(), baseline_count + 24);
+    assert_eq!(client.data_schema_version(), 3);
+    assert_eq!(client.current_version(), 3);
+}
+
+#[test]
+fn test_migration_preserves_positions_under_rollback() {
+    // Even when an upgrade is rolled back after a migration write was
+    // already performed, both the legacy positions AND the migration's
+    // new entries persist (Soroban storage is not transactional with
+    // upgrade state). This pins behaviour so a future migration author
+    // does not inadvertently rely on rollback to "undo" writes.
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin) = setup_with_upgrade_init(&env, 1);
+
+    let entries = seed_multi_asset_positions(&env, &client, &admin, 2, 2);
+
+    let proposal = client.upgrade_propose(&admin, &hash(&env, 2), &1);
+    client.upgrade_execute(&admin, &proposal);
+
+    // Simulate the migration writing some new fields
+    let migration_key = SorobanString::from_str(&env, "v1_migration_flag");
+    let migration_val = soroban_sdk::Bytes::from_slice(&env, &[0xAB; 4]);
+    client.data_save(&admin, &migration_key, &migration_val);
+
+    // Rollback the upgrade
+    client.upgrade_rollback(&admin, &proposal);
+    assert_eq!(client.current_version(), 0);
+
+    // Legacy positions still intact
+    for (key, expected) in entries.iter() {
+        assert_eq!(&client.data_load(key), expected);
+    }
+    // Migration write also persists across rollback (documents real behaviour)
+    assert_eq!(client.data_load(&migration_key), migration_val);
+}
+
+#[test]
+fn test_view_consistency_after_upgrade() {
+    // The total entry count and per-key reads must match what we wrote.
+    // This serves as a "view consistency" check at the data_store level:
+    // the public read API agrees with what the upgrade preserved.
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin) = setup_with_upgrade_init(&env, 1);
+
+    let entries = seed_multi_asset_positions(&env, &client, &admin, 5, 2);
+    let pre_count = client.data_entry_count();
+
+    // Backup before upgrade so we can compare restore semantics
+    let backup_name = SorobanString::from_str(&env, "pre_layout_change");
+    client.data_backup(&admin, &backup_name);
+
+    let p1 = client.upgrade_propose(&admin, &hash(&env, 2), &1);
+    client.upgrade_execute(&admin, &p1);
+    client.data_migrate_bump_version(
+        &admin,
+        &1,
+        &SorobanString::from_str(&env, "v1_view_consistency"),
+    );
+
+    // Per-entry view consistency
+    for (key, expected) in entries.iter() {
+        assert_eq!(&client.data_load(key), expected);
+    }
+    // Aggregate view consistency
+    assert_eq!(client.data_entry_count(), pre_count);
+
+    // Restoring the pre-upgrade backup must yield the exact same set
+    client.data_restore(&admin, &backup_name);
+    for (key, expected) in entries.iter() {
+        assert_eq!(&client.data_load(key), expected);
+    }
+    assert_eq!(client.data_entry_count(), pre_count);
 }

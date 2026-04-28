@@ -43,10 +43,11 @@ Our CI pipeline consists of several jobs that run in parallel and series:
 
 ### 5. Code Coverage (`coverage`)
 
-- **Purpose**: Code coverage reporting
+- **Purpose**: Code coverage reporting and enforcement
 - **Runs on**: `ubuntu-latest`
-- **Condition**: Only on main branch pushes
-- **Output**: Coverage report to Codecov
+- **Condition**: Part of the main CI job
+- **Output**: Generates `cobertura.xml`
+- **Enforcement**: Fails the build if test coverage for the `stellar-lend` lending crate drops below 95%.
 
 ## Caching Strategy
 
@@ -153,7 +154,19 @@ cargo test --verbose
 cargo doc --no-deps
 ```
 
-#### 5. Security Audit
+#### 5. Code Coverage & Thresholds
+
+```bash
+# Generate coverage using cargo-tarpaulin
+cd stellar-lend/contracts/lending
+cargo tarpaulin --out Xml
+
+# Check coverage against the 95% threshold requirement
+python3 ../../../scripts/enforce_coverage.py cobertura.xml --threshold 95.0
+```
+> Note: The CI pipeline enforces a minimum of 95% test coverage for the lending crate. If coverage drops below this threshold, the build will fail.
+
+#### 6. Security Audit
 
 ```bash
 cd stellar-lend

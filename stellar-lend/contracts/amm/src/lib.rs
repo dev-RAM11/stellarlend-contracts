@@ -23,7 +23,9 @@ pub use crate::amm::{
 };
 
 use stellarlend_common::upgrade;
-pub struct DebugConfig { pub x: i128 }
+pub struct DebugConfig {
+    pub x: i128,
+}
 
 #[contract]
 pub struct AmmContract;
@@ -110,6 +112,9 @@ impl AmmContract {
     /// * `admin` - The admin address
     /// * `default_slippage` - Default slippage tolerance in basis points (e.g., 100 = 1%)
     /// * `max_slippage` - Maximum allowed slippage in basis points
+    /// * `max_price_divergence` - Maximum price divergence between AMM and oracle
+    /// * `oracle_address` - Oracle contract address for price validation
+    /// * `native_asset_address` - Native asset address for price validation
     /// * `auto_swap_threshold` - Minimum amount for auto-swap operations
     ///
     /// # Returns
@@ -119,6 +124,9 @@ impl AmmContract {
         admin: Address,
         default_slippage: i128,
         max_slippage: i128,
+        max_price_divergence: i128,
+        oracle_address: Option<Address>,
+        native_asset_address: Option<Address>,
         auto_swap_threshold: i128,
     ) -> Result<(), AmmError> {
         initialize_amm_settings(
@@ -126,6 +134,9 @@ impl AmmContract {
             admin,
             default_slippage,
             max_slippage,
+            max_price_divergence,
+            oracle_address,
+            native_asset_address,
             auto_swap_threshold,
         )
     }
@@ -402,13 +413,15 @@ impl AmmContract {
 // when lending is available as a dependency.
 #[cfg(test)]
 mod amm_coverage_booster;
-#[cfg(all(test, feature = "liquidate_integration"))]
-mod liquidate_test;
 #[cfg(test)]
 mod integration_test;
+#[cfg(all(test, feature = "liquidate_integration"))]
+mod liquidate_test;
 #[cfg(test)]
 mod math_safety_test;
 #[cfg(test)]
 mod test;
+#[cfg(test)]
+mod amm_invariant_test;
 
 //

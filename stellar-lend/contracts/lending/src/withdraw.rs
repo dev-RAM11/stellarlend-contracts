@@ -6,7 +6,7 @@
 //! ## Pause & emergency alignment
 //!
 //! Withdraw respects:
-//! - Legacy `WithdrawDataKey::Paused` (storage compatibility),
+//! - Legacy `WithdrawDataKey::WithdrawPaused` (storage compatibility),
 //! - Granular [`crate::pause::PauseType::Withdraw`] and global [`crate::pause::PauseType::All`]
 //!   via [`crate::pause::is_paused`],
 //! - Emergency lifecycle: **shutdown** blocks unwind; **recovery** allows `withdraw` and `repay`
@@ -24,28 +24,17 @@
 use soroban_sdk::{contracterror, contractevent, contracttype, Address, Env};
 
 use crate::borrow::{validate_collateral_ratio, BorrowDataKey, BorrowError, DebtPosition};
-use crate::constants::BPS_SCALE;
 use crate::deposit::{DepositCollateral, DepositDataKey};
 use crate::pause::{self, PauseType};
 
 /// Errors that can occur during withdraw operations
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum WithdrawError {
-    InvalidAmount = 1,
-    WithdrawPaused = 2,
-    Overflow = 3,
-    InsufficientCollateral = 4,
-    InsufficientCollateralRatio = 5,
-    Unauthorized = 6,
-}
+pub use crate::errors::WithdrawError;
 
 /// Storage keys for withdraw-related data
 #[contracttype]
 #[derive(Clone)]
 pub enum WithdrawDataKey {
-    Paused,
+    WithdrawPaused,
     MinWithdrawAmount,
 }
 
@@ -64,6 +53,9 @@ pub struct WithdrawEvent {
 /// facade layer: granular withdraw pause, global `All`, legacy flag, and shutdown (but not
 /// recovery) blocking.
 fn ensure_withdraw_allowed(env: &Env) -> Result<(), WithdrawError> {
+    if pause::is_read_only(env) {
+        return Err(WithdrawError::WithdrawPaused);
+    }
     if legacy_withdraw_paused(env) {
         return Err(WithdrawError::WithdrawPaused);
     }
@@ -80,7 +72,7 @@ fn ensure_withdraw_allowed(env: &Env) -> Result<(), WithdrawError> {
 fn legacy_withdraw_paused(env: &Env) -> bool {
     env.storage()
         .persistent()
-        .get(&WithdrawDataKey::Paused)
+        .get(&WithdrawDataKey::WithdrawPaused)
         .unwrap_or(false)
 }
 
@@ -89,6 +81,7 @@ fn map_borrow_to_withdraw(e: BorrowError) -> WithdrawError {
         BorrowError::InsufficientCollateral => WithdrawError::InsufficientCollateralRatio,
         BorrowError::Overflow => WithdrawError::Overflow,
         BorrowError::InvalidAmount => WithdrawError::InvalidAmount,
+        BorrowError::AssetNotSupported => WithdrawError::AssetNotSupported,
         _ => WithdrawError::InsufficientCollateralRatio,
     }
 }
@@ -117,6 +110,9 @@ pub fn withdraw(
     asset: Address,
     amount: i128,
 ) -> Result<i128, WithdrawError> {
+    crate::asset_registry::require_registered_asset(env, &asset)
+        .map_err(|_| WithdrawError::AssetNotSupported)?;
+
     user.require_auth();
 
     ensure_withdraw_allowed(env)?;
@@ -185,7 +181,8 @@ fn validate_collateral_ratio_after_withdraw(
             .ok_or(WithdrawError::Overflow)?;
 
         if total_debt > 0 {
-            validate_collateral_ratio(remaining_collateral, total_debt).map_err(map_borrow_to_withdraw)?;
+            validate_collateral_ratio(remaining_collateral, total_debt)
+                .map_err(map_borrow_to_withdraw)?;
         }
     }
 
@@ -197,12 +194,15 @@ pub fn initialize_withdraw_settings(
     env: &Env,
     min_withdraw_amount: i128,
 ) -> Result<(), WithdrawError> {
+    if pause::is_read_only(env) {
+        return Err(WithdrawError::WithdrawPaused);
+    }
     env.storage()
         .persistent()
         .set(&WithdrawDataKey::MinWithdrawAmount, &min_withdraw_amount);
     env.storage()
         .persistent()
-        .set(&WithdrawDataKey::Paused, &false);
+        .set(&WithdrawDataKey::WithdrawPaused, &false);
     Ok(())
 }
 
@@ -216,7 +216,7 @@ pub fn initialize_withdraw_settings(
 pub fn set_withdraw_paused(env: &Env, paused: bool) -> Result<(), WithdrawError> {
     env.storage()
         .persistent()
-        .set(&WithdrawDataKey::Paused, &paused);
+        .set(&WithdrawDataKey::WithdrawPaused, &paused);
     Ok(())
 }
 

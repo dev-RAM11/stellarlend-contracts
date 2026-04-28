@@ -144,7 +144,7 @@ fn test_amm_swap_invalid_params() {
     client.set_amm_pool(&admin, &protocol_config);
 
     // Case 1: Deadline exceeded
-    env.ledger().set_timestamp(2000);
+    env.ledger().with_mut(|li| li.timestamp = 2000);
     let swap_params = SwapParams {
         protocol: protocol_addr.clone(),
         token_in: None,

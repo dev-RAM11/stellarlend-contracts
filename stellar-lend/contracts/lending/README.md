@@ -80,12 +80,36 @@ graph LR
     Contract -- "Tokens (Borrow/Withdraw)" --> User
 ```
 
-### Liquidation Flow
-```mermaid
-graph LR
-    Liquidator[Liquidator] -- "Repay Debt Assets" --> Contract[Lending Contract]
-    Contract -- "Transfer Collateral Bonus" --> Liquidator
-```
+## View Serialization Stability
+
+The contract treats the current struct-returning getter responses as view schema `v1`.
+
+Covered getters:
+
+- `get_user_debt() -> DebtPosition`
+- `get_user_collateral() -> BorrowCollateral`
+- `get_user_collateral_deposit() -> DepositCollateral`
+- `get_user_position() -> UserPositionSummary`
+
+Wire-format guarantee:
+
+- Soroban `#[contracttype]` structs encode as XDR maps keyed by field name.
+- The generated conversion code sorts those keys lexicographically, so the on-wire key order is deterministic.
+- Snapshot-style tests lock the current XDR encoding for the getter structs above.
+
+Stable decoding guidance:
+
+- Decode these responses by field name, not by source declaration order.
+- Treat the current field set and field names as schema `v1`.
+- Do not assume a new field can be added safely to an existing getter response. Even additive changes can break strict decoders and hash-based snapshots.
+
+Versioning strategy:
+
+- Existing getter response structs are preserved in place for schema `v1`.
+- Any additive or breaking change to one of the getter structs must ship as a new versioned getter/type, for example `get_user_position_v2()`, instead of mutating the current response shape.
+- A runtime `schema` field is intentionally not added to the existing structs because that would itself be a breaking ABI change for the current getter surface.
+
+## Contract Interface
 
 ### Flash Loan Flow
 ```mermaid
@@ -113,7 +137,9 @@ sequenceDiagram
 ## Documentation
 
 Comprehensive guides are available for specific components:
+- [Developer Glossary](../../../docs/glossary.md): Key protocol terms and numeric scales.
 - [Borrow & Interest](./borrow.md): Detailed logic for borrowing and collateral.
+
 - [Pause & Emergency](./pause.md): How the pause and emergency states work.
 - [Emergency Shutdown](./emergency_shutdown.md): Procedures for protocol shutdown.
 - [Flash Loans](./flash_loan.md): Technical details on flash loan execution.

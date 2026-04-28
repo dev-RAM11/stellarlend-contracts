@@ -52,6 +52,8 @@ fn test_shutdown_blocks_high_risk_ops_and_recovery_allows_unwind_only() {
     let collateral_asset = Address::generate(&env);
 
     client.initialize(&admin, &1_000_000_000, &1000);
+    client.register_asset(&admin, &asset);
+    client.register_asset(&admin, &collateral_asset);
     client.set_guardian(&admin, &guardian);
     client.initialize_deposit_settings(&1_000_000_000, &100);
     client.initialize_withdraw_settings(&100);
@@ -117,6 +119,8 @@ fn test_recovery_transition_edge_cases_and_partial_pause() {
     let collateral_asset = Address::generate(&env);
 
     client.initialize(&admin, &1_000_000_000, &1000);
+    client.register_asset(&admin, &asset);
+    client.register_asset(&admin, &collateral_asset);
     client.set_guardian(&admin, &guardian);
     client.initialize_deposit_settings(&1_000_000_000, &100);
     client.initialize_withdraw_settings(&100);

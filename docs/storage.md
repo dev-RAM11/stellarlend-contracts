@@ -1,12 +1,14 @@
 # StellarLend Storage Layout and Migration Guide
 
-This document describes the persistent storage structure of the StellarLend protocol on Soroban. It serves as a reference for developers, auditors, and for planning contract upgrades.
+This document describes the persistent storage structure of the StellarLend protocol on Soroban.
 
 ## Overview
 
-StellarLend uses Soroban's `persistent()` storage for all long-term data. This ensures that user balances, protocol configurations, and risk parameters remain available across ledger boundaries. All keys are defined using `contracttype` enums or `Symbol` to ensure type safety and avoid collisions.
+StellarLend uses Soroban's `persistent()` storage for all long-term data.
+All keys are defined using `contracttype` enums.
 
----
+> [!IMPORTANT]
+> **Namespace Isolation**: To prevent collisions between modules, all storage key enum variants MUST be unique across the entire contract. Even different enum types will collide if their variants share the same name (as they serialize to the same `Symbol`).
 
 ## Storage Map
 
@@ -132,3 +134,59 @@ If a storage layout change is unavoidable (e.g., merging two maps into one), fol
 - [ ] No `temporary()` or `instance()` storage is used for critical state.
 - [ ] `AssetKey` correctly handles both Native (XLM) and Token assets.
 - [ ] Key collisions between modules are avoided by using unique Enum types for keys.
+
+---
+
+## Migration Checklist — User Position Preservation
+
+When introducing a new storage field or key (a "layout addition"), follow this
+checklist to guarantee user positions (collateral, debt, rates, timestamps)
+survive the upgrade unchanged. The safety tests in
+`stellar-lend/contracts/lending/src/upgrade_migration_safety_test.rs` enforce
+the same invariants programmatically.
+
+### Pre-upgrade
+
+- [ ] **Snapshot rich fixture**: confirm seed data covers multiple users and
+  multiple assets, with collateral, debt, rate, and timestamp fields populated.
+- [ ] **Backup**: call `data_backup` and store the snapshot name. The
+  `test_view_consistency_after_upgrade` test models this flow.
+- [ ] **Schema version recorded**: capture `data_schema_version()` for use as
+  the strict-greater-than check in the new bump.
+
+### During the upgrade
+
+- [ ] **Append-only**: new storage keys MUST live under fresh, non-overlapping
+  namespaces. Never reuse a legacy key for a different value type. The
+  `test_new_storage_fields_coexist_with_preserved_positions` test asserts the
+  new keys never alias the old ones.
+- [ ] **No in-place rewrites of legacy entries**: the migration may *read*
+  legacy entries to derive new ones, but must never overwrite them with a
+  different encoding during the same migration.
+- [ ] **Bump schema version**: call `data_migrate_bump_version` with the new
+  version and a memo describing the layout addition.
+
+### Post-upgrade verification
+
+- [ ] **Per-entry round-trip**: every legacy `(key, value)` pair must read back
+  identically. `test_positions_preserved_across_upgrade_layout_addition` and
+  `test_position_decoding_after_upgrade_round_trip` pin this at both the
+  byte-level and the decoded-field level.
+- [ ] **Aggregate count**: `data_entry_count()` for legacy keys must remain
+  unchanged; the count for new keys must equal exactly what the migration
+  wrote.
+- [ ] **Sequential safety**: if multiple migrations are chained, each step
+  must independently preserve all preceding entries. See
+  `test_positions_preserved_across_sequential_layout_additions`.
+- [ ] **Rollback semantics documented**: storage writes are not transactional
+  with upgrade execution. Document any keys the migration wrote so operators
+  understand they will persist even if the upgrade is rolled back. See
+  `test_migration_preserves_positions_under_rollback`.
+
+### Security notes
+
+- A migration that silently mutates or drops user positions can socialise
+  losses across the borrower set. Treat any test failure in
+  `upgrade_migration_safety_test.rs` as a release-blocker.
+- New storage namespaces must not collide with legacy namespaces by symbol or
+  by enum discriminant. Add a regression test alongside any new storage key.

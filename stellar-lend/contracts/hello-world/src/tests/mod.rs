@@ -1,16 +1,15 @@
-
+pub mod collateral_factor_max_borrow_spec;
 pub mod config_test;
+pub mod cross_asset_test;
+pub mod emergency_shutdown_test;
 pub mod governance_test;
 pub mod guardian_threshold_safety_test;
-pub mod oracle_test;
-pub mod storage_layout_test;
-pub mod withdraw_test;
 pub mod interest_rate_test;
+pub mod oracle_test;
 pub mod reserve_test;
-pub mod cross_asset_test;
-pub mod collateral_factor_max_borrow_spec;
+pub mod storage_layout_test;
 pub mod test_helpers;
-pub mod emergency_shutdown_test;
+pub mod withdraw_test;
 // Disabled — pre-existing failures unrelated to this issue
 // pub mod amm_impact_test;
 // pub mod analytics_test;
@@ -37,7 +36,14 @@ pub mod cross_contract_test;
 pub mod gov_asset_test;
 pub mod multisig_governance_execution_test;
 pub mod multisig_test;
+pub mod multisig_threshold_safety_test;
 pub mod oracle_staleness_fallback_test;
+pub mod read_only_test;
 pub mod recovery_test;
 // pub mod fuzz_test;
 // pub mod fees_test;
+
+pub mod snapshot_test;
+pub mod liquidate_hardened_test;
+pub mod liquidate_amm_test;
+pub mod price_oscillation_stress_test;

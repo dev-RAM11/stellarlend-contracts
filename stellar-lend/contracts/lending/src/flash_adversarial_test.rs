@@ -378,3 +378,49 @@ fn test_protocol_balance_grows_by_exact_fee() {
 
     assert_eq!(token.balance(&contract_id), initial + fee);
 }
+
+/// Attempts to deposit collateral during the callback.
+#[contract]
+pub struct DepositMutantReceiver;
+
+#[contractimpl]
+impl DepositMutantReceiver {
+    pub fn on_flash_loan(
+        env: Env,
+        _initiator: Address,
+        asset: Address,
+        amount: i128,
+        fee: i128,
+        _params: Bytes,
+    ) -> bool {
+        let client = LendingContractClient::new(&env, &env.current_contract_address());
+
+        // Try to deposit - this should be blocked by reentrancy guard or state check
+        // even if we have funds.
+        client.deposit(&env.current_contract_address(), &asset, &100);
+
+        // Repay
+        token::Client::new(&env, &asset).transfer(
+            &env.current_contract_address(),
+            &_initiator,
+            &(amount + fee),
+        );
+        true
+    }
+}
+
+// ─── 15. State mutation blocked ──────────────────────────────────────────────
+
+#[test]
+#[should_panic(expected = "HostError: Error(Context, InvalidAction)")]
+fn test_state_mutation_during_flash_loan_blocked() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _, asset) = setup_with_balance(&env, 100_000);
+    let receiver = env.register(DepositMutantReceiver, ());
+
+    // Give receiver some funds to deposit
+    token::StellarAssetClient::new(&env, &asset).mint(&receiver, &1000);
+
+    client.flash_loan(&receiver, &asset, &10_000, &Bytes::new(&env));
+}

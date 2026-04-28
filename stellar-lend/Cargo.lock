@@ -278,7 +278,7 @@ dependencies = [
 name = "bridge"
 version = "0.0.0"
 dependencies = [
- "soroban-sdk 25.3.1",
+ "soroban-sdk 25.3.0",
  "stellarlend-common",
 ]
 
@@ -1013,7 +1013,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "hello-world"
 version = "0.0.0"
 dependencies = [
- "soroban-sdk 25.3.1",
+ "soroban-sdk 25.3.0",
  "soroban-token-sdk",
  "stellar-contract-utils",
  "stellar-macros",
@@ -2426,9 +2426,9 @@ dependencies = [
 
 [[package]]
 name = "soroban-sdk"
-version = "25.3.1"
+version = "25.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4502f2e018f238a4c5d3212d7d20ea6abcdc6e58babd63b642b693739db30fd1"
+checksum = "5fb27e93f8d3fc3a815d24c60ec11e893c408a36693ec9c823322f954fa096ae"
 dependencies = [
  "arbitrary",
  "bytes-lit",
@@ -2549,16 +2549,24 @@ dependencies = [
 name = "soroban-timelock"
 version = "0.0.0"
 dependencies = [
- "soroban-sdk 25.3.1",
+ "soroban-sdk 25.3.0",
 ]
 
 [[package]]
 name = "soroban-token-sdk"
-version = "25.3.1"
+version = "25.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8230fe7cf1bf138068cbe5cfa54a76657bed8a9bb6a89a4a229383116d3f067"
+checksum = "7257d888e42da01d031cfc388d4c9c10e4e13388a4e04deabf812fa7d33f0af3"
 dependencies = [
- "soroban-sdk 25.3.1",
+ "soroban-sdk 25.3.0",
+]
+
+[[package]]
+name = "soroban-token-vesting"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk 25.3.0",
+ "soroban-token-sdk",
 ]
 
 [[package]]
@@ -2684,7 +2692,7 @@ dependencies = [
 name = "stellarlend-amm"
 version = "0.1.0"
 dependencies = [
- "soroban-sdk 25.3.1",
+ "soroban-sdk 25.3.0",
  "soroban-token-sdk",
  "stellarlend-common",
 ]
@@ -2704,6 +2712,8 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "soroban-sdk 25.3.0",
+ "stellarlend-lending",
  "test-case",
  "thiserror",
  "tokio",
@@ -2718,14 +2728,14 @@ dependencies = [
 name = "stellarlend-common"
 version = "0.1.0"
 dependencies = [
- "soroban-sdk 25.3.1",
+ "soroban-sdk 25.3.0",
 ]
 
 [[package]]
 name = "stellarlend-lending"
 version = "0.1.0"
 dependencies = [
- "soroban-sdk 25.3.1",
+ "soroban-sdk 25.3.0",
  "soroban-token-sdk",
  "stellarlend-common",
 ]

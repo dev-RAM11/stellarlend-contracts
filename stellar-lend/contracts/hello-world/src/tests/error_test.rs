@@ -45,7 +45,6 @@ fn test_unauthorized_admin_calls() {
             &None,
             &None,
             &None,
-            &None,
             &None
         )
         .is_err());

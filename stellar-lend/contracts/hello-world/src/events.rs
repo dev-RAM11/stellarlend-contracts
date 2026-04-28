@@ -1,9 +1,55 @@
 #![allow(unused_variables)]
 
-use soroban_sdk::{contractevent, Address, Env, String, Symbol, Vec};
 use crate::prelude::*;
+use soroban_sdk::{contractevent, Address, Env, String, Symbol, Vec};
 
 use crate::types::{AssetStatus, ProposalType, VoteType};
+
+// ============================================================================
+// Event Schema Versioning
+//
+// All versioned event structs (those with a `schema_version` field) MUST use
+// this constant. Indexers and integrators should read `schema_version` from
+// each event payload to determine the decoding strategy.
+//
+// Upgrade policy:
+//   - Additive field additions: bump EVENT_SCHEMA_VERSION, keep old fields.
+//   - Breaking changes: introduce a new struct (e.g. FooEventV2) and emit
+//     both the old and new struct for one upgrade cycle, then retire the old.
+//   - The `SchemaVersionEvent` is emitted once during `initialize` so
+//     indexers can anchor the starting version for a given contract instance.
+// ============================================================================
+
+/// Current event schema version.
+///
+/// Increment this constant whenever a versioned event struct gains or removes
+/// a field. All structs that carry a `schema_version: u32` field must be
+/// populated with this value at emit time.
+pub const EVENT_SCHEMA_VERSION: u32 = 1;
+
+/// Emitted once during contract initialisation.
+///
+/// Indexers should persist this value and use it to select the correct
+/// decoding path for all subsequent versioned events from this contract.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SchemaVersionEvent {
+    /// The schema version active at the time of initialisation.
+    pub version: u32,
+    /// Ledger timestamp of the initialisation call.
+    pub timestamp: u64,
+}
+
+/// Emit the schema version anchor event.
+///
+/// Call this exactly once inside the contract `initialize` function.
+pub fn emit_schema_version(e: &Env, timestamp: u64) {
+    SchemaVersionEvent {
+        version: EVENT_SCHEMA_VERSION,
+        timestamp,
+    }
+    .publish(e);
+}
 
 // ============================================================================
 // Core Lending Events (Existing)
@@ -124,6 +170,29 @@ pub struct FlashLoanRepaidEvent {
 pub struct AdminActionEvent {
     pub actor: Address,
     pub action: Symbol,
+    pub timestamp: u64,
+}
+
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug)]
+pub struct InterestRateConfigUpdatedEvent {
+    pub actor: Address,
+    pub base_rate_bps: i128,
+    pub kink_utilization_bps: i128,
+    pub multiplier_bps: i128,
+    pub jump_multiplier_bps: i128,
+    pub rate_floor_bps: i128,
+    pub rate_ceiling_bps: i128,
+    pub spread_bps: i128,
+    pub timestamp: u64,
+}
+
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug)]
+pub struct EmergencyRateAdjustmentEvent {
+    pub actor: Address,
+    pub old_adjustment_bps: i128,
+    pub new_adjustment_bps: i128,
     pub timestamp: u64,
 }
 
@@ -474,6 +543,26 @@ pub fn emit_flash_loan_repaid(e: &Env, event: FlashLoanRepaidEvent) {
 
 pub fn emit_admin_action(e: &Env, event: AdminActionEvent) {
     event.publish(e);
+}
+
+pub fn emit_interest_rate_config_updated(e: &Env, event: InterestRateConfigUpdatedEvent) {
+    e.events().publish(
+        (
+            Symbol::new(e, "interest_rate_config_updated"),
+            event.actor.clone(),
+        ),
+        event,
+    );
+}
+
+pub fn emit_emergency_rate_adjustment(e: &Env, event: EmergencyRateAdjustmentEvent) {
+    e.events().publish(
+        (
+            Symbol::new(e, "emergency_rate_adjustment"),
+            event.actor.clone(),
+        ),
+        event,
+    );
 }
 
 pub fn emit_price_updated(e: &Env, event: PriceUpdatedEvent) {

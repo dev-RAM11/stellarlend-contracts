@@ -23,7 +23,7 @@ use crate::governance::{
     set_multisig_threshold,
 };
 use crate::types::ProposalType;
-use crate::types::{Action, GovernanceConfig, MultisigConfig};
+use crate::types::{Action, GovernanceConfig, MultisigConfig, ProposalStatus};
 use crate::HelloContract;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -1042,7 +1042,8 @@ fn test_rapid_proposal_creation_and_approval() {
         let mut proposal_ids = Vec::new(&env);
         for i in 0..10 {
             let new_ratio = 15_000 + (i as i128 * 100);
-            let pid = propose_set_min_collateral_ratio(&env, admin.clone(), new_ratio as u32).unwrap();
+            let pid =
+                propose_set_min_collateral_ratio(&env, admin.clone(), new_ratio as u32).unwrap();
             proposal_ids.push_back(pid);
         }
 

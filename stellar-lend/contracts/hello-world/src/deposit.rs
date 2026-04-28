@@ -23,13 +23,13 @@
 //! - Token transfers use `transfer_from`, requiring prior user approval.
 
 #![allow(unused)]
-use soroban_sdk::{contracterror, contracttype, Address, Env, IntoVal, Map, Symbol, Val, Vec};
 use crate::prelude::*;
+use soroban_sdk::{contracterror, contracttype, Address, Env, IntoVal, Map, Symbol, Val, Vec};
 
 use crate::events::{
     emit_analytics_updated, emit_borrower_health_v1, emit_deposit, emit_position_updated,
     emit_user_activity_tracked, AnalyticsUpdatedEvent, BorrowerHealthEventV1, DepositEvent,
-    PositionUpdatedEvent, UserActivityTrackedEvent,
+    PositionUpdatedEvent, UserActivityTrackedEvent, EVENT_SCHEMA_VERSION,
 };
 
 /// Errors that can occur during deposit operations
@@ -51,6 +51,8 @@ pub enum DepositError {
     Overflow = 6,
     /// Reentrancy detected
     Reentrancy = 7,
+    /// Protocol is in read-only mode
+    ReadOnlyMode = 8,
 }
 
 /// Storage keys for deposit-related data
@@ -380,7 +382,7 @@ pub fn set_native_asset_address(
     native_asset: Address,
 ) -> Result<(), DepositError> {
     crate::admin::require_admin(env, &caller).map_err(|_| DepositError::InvalidAsset)?;
-    
+
     if native_asset == env.current_contract_address() {
         return Err(DepositError::InvalidAsset);
     }
@@ -527,7 +529,7 @@ pub fn emit_position_updated_event(
     emit_borrower_health_v1(
         env,
         BorrowerHealthEventV1 {
-            schema_version: 1,
+            schema_version: EVENT_SCHEMA_VERSION,
             user: user.clone(),
             operation,
             collateral: position.collateral,
@@ -632,6 +634,7 @@ pub fn emit_user_activity_tracked_event(
 enum RiskDataKey {
     RiskConfig,
     EmergencyPause,
+    ReadOnlyMode,
 }
 
 /// Check risk management pause status
@@ -640,7 +643,19 @@ enum RiskDataKey {
 fn check_risk_management_pause(env: &Env) -> Result<(), DepositError> {
     // Define risk management storage keys locally to avoid dependency
 
-    // Check emergency pause first
+    // 1. Check Read-only mode first (highest precedence)
+    let read_only_key = RiskDataKey::ReadOnlyMode;
+    if let Some(read_only) = env
+        .storage()
+        .persistent()
+        .get::<RiskDataKey, bool>(&read_only_key)
+    {
+        if read_only {
+            return Err(DepositError::ReadOnlyMode);
+        }
+    }
+
+    // 2. Check emergency pause second
     let emergency_key = RiskDataKey::EmergencyPause;
     if let Some(emergency_paused) = env
         .storage()
@@ -651,12 +666,6 @@ fn check_risk_management_pause(env: &Env) -> Result<(), DepositError> {
             return Err(DepositError::DepositPaused);
         }
     }
-
-    // Check operation-specific pause in risk config
-    // Note: We need to access the RiskConfig struct, but to avoid circular dependencies,
-    // we'll check if the config exists and try to read pause_switches
-    // For now, we'll skip this check and rely on the old pause switch system
-    // The risk management pause switches should be checked at the contract API level
 
     Ok(())
 }

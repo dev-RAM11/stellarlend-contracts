@@ -23,8 +23,8 @@ use crate::events::{
     emit_flash_loan_initiated, emit_flash_loan_repaid, FlashLoanInitiatedEvent,
     FlashLoanRepaidEvent,
 };
-use soroban_sdk::{contracterror, contracttype, Address, Env, IntoVal, Map, Symbol, Val, Vec};
 use crate::prelude::*;
+use soroban_sdk::{contracterror, contracttype, Address, Env, IntoVal, Map, Symbol, Val, Vec};
 
 use crate::deposit::DepositDataKey;
 
@@ -53,6 +53,8 @@ pub enum FlashLoanError {
     InvalidCallback = 9,
     /// Callback execution failed
     CallbackFailed = 10,
+    /// Protocol is in read-only mode
+    ReadOnlyMode = 11,
 }
 
 /// Storage keys for flash loan-related data
@@ -125,11 +127,26 @@ fn get_flash_loan_config(env: &Env) -> FlashLoanConfig {
         .unwrap_or_else(get_default_config)
 }
 
-/// Calculate flash loan fee
+/// Calculate flash loan fee.
+///
+/// ## Rounding Semantics
+/// `fee = amount * fee_bps / 10_000` — integer division truncates toward zero.
+/// Small `amount` values may produce a zero fee; the minimum non-zero fee
+/// occurs when `amount >= ceil(10_000 / fee_bps)`.
+///
+/// ## Overflow
+/// Uses `checked_mul` / `checked_div`; if `amount * fee_bps` exceeds `i128::MAX`
+/// the function returns `FlashLoanError::Overflow` rather than silently
+/// saturating — this is stricter than the lending contract's `saturating_*`
+/// behavior and should be preferred for large-amount safety.
+///
+/// ## Fee-Splitting (Security)
+/// Because rounding is per-call, splitting one large loan into N sub-threshold
+/// calls can reduce total fees.  Use `configure_flash_loan` to set `min_amount`
+/// ≥ `ceil(10_000 / fee_bps)` to prevent zero-fee loans.
 fn calculate_flash_loan_fee(env: &Env, amount: i128) -> Result<i128, FlashLoanError> {
     let config = get_flash_loan_config(env);
 
-    // Fee = amount * fee_bps / 10000
     amount
         .checked_mul(config.fee_bps)
         .ok_or(FlashLoanError::Overflow)?
@@ -214,12 +231,23 @@ pub fn execute_flash_loan(
         return Err(FlashLoanError::InvalidAmount);
     }
 
-    // Check if flash loans are paused
-    let pause_key = FlashLoanDataKey::PauseSwitches;
+    // Check pause status
+    // 1. Read-only mode (highest precedence)
+    if crate::risk_management::is_read_only_mode(env) {
+        return Err(FlashLoanError::ReadOnlyMode);
+    }
+
+    // 2. Emergency pause
+    if crate::risk_management::is_emergency_paused(env) {
+        return Err(FlashLoanError::FlashLoanPaused);
+    }
+
+    // 3. Per-operation pause
+    let pause_switches_key = FlashLoanDataKey::PauseSwitches;
     if let Some(pause_map) = env
         .storage()
         .persistent()
-        .get::<FlashLoanDataKey, Map<Symbol, bool>>(&pause_key)
+        .get::<FlashLoanDataKey, Map<Symbol, bool>>(&pause_switches_key)
     {
         if let Some(paused) = pause_map.get(Symbol::new(env, "pause_flash_loan")) {
             if paused {
@@ -357,7 +385,7 @@ pub fn execute_flash_loan(
 /// - Protects configuration modifications allowing only admin to modify fee basis points.
 pub fn set_flash_loan_fee(env: &Env, caller: Address, fee_bps: i128) -> Result<(), FlashLoanError> {
     // Check authorization
-        crate::admin::require_admin(env, &caller).map_err(|_| FlashLoanError::InvalidCallback)?;
+    crate::admin::require_admin(env, &caller).map_err(|_| FlashLoanError::InvalidCallback)?;
 
     // Validate fee (must be between 0 and 10000 basis points)
     if !(0..=10000).contains(&fee_bps) {

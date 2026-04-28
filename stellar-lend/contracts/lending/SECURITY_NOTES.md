@@ -28,3 +28,26 @@ Protocol parameters strictly utilize `checked_add`, `checked_sub`, `checked_mul`
 - **Pause module**: Withdraw is blocked when `pause::is_paused(Withdraw)` is true (this includes global `PauseType::All`), when the legacy `WithdrawDataKey::Paused` flag is set, or when the protocol is in **emergency shutdown** (`blocks_high_risk_ops` and not in **recovery**). In **recovery**, users may still withdraw (and repay) to unwind positions.
 - **Collateral ratio**: Post-withdraw collateral must satisfy the same minimum ratio as borrows, via shared `borrow::validate_collateral_ratio` (150% default, `MIN_COLLATERAL_RATIO_BPS`).
 - **Authorization**: Only the position owner can withdraw; `user.require_auth()` is enforced before state changes.
+
+### Liquidation Boundary and Health Factor Scaling
+The protocol represents the Health Factor using a scalar where `10_000` equates to `1.0`. 
+To ensure determinism and avoid rounding ambiguity, the protocol strictly enforces the `<` threshold for liquidation eligibility. 
+* A position with a Health Factor `<= 9_999` **is eligible** for liquidation.
+* A position with a Health Factor `>= 10_000` **is completely immune** to liquidation. 
+
+There are no edge cases where a `10_000` Health Factor allows for liquidation. All price oracle rounding uses integer truncations designed to safely error on the side of protecting the borrower from false-positive liquidations.
+
+## Oracle Migration Risks and Mitigation
+
+Changing the protocol oracle (either the legacy address or the hardened module primary/fallback slots) is a high-risk administrative action that impacts the valuation of all open positions.
+
+### Risks
+- **Price Jump Liquidation**: Swapping to an oracle that reports a significantly lower price for collateral (or higher for debt) can instantly push healthy positions into liquidation eligibility.
+- **Staleness Gaps**: If a new oracle has not yet submitted a price feed, valuation will fail (returning 0), blocking withdrawals and potentially enabling liquidations if not handled safely.
+- **Misconfiguration**: Setting an incorrect oracle address or one with different decimal scales (the protocol expects 8 decimals) leads to incorrect health factor calculations.
+
+### Mitigation and Operational Guidance
+- **Deterministic Precedence**: The protocol prioritizes the Hardened Oracle Module over the Legacy Oracle address. This allows for a "staged" migration where a hardened feed is configured and verified before removing the legacy fallback.
+- **Auditable Transitions**: All oracle changes emit events (`OracleSetEvent` or `OracleConfigEvent`) containing the admin, the new address, and the timestamp, ensuring a clear audit trail of price-source transitions.
+- **Safe Failure Modes**: If an oracle returns an invalid price or is missing, the health factor defaults to 0. The `liquidate` function explicitly rejects positions with HF=0 to prevent "phantom liquidations" caused by missing price data.
+- **Pre-Migration Valuation**: Admins should use view functions (`get_user_position`) with the proposed oracle price off-chain before committing the change on-chain to ensure no mass-liquidation event is triggered.

@@ -27,9 +27,12 @@
 //! Every [`BridgeConfig`] stores a `network_id` that identifies the remote
 //! chain this bridge connects to. Deposit and withdrawal events include the
 //! `network_id` so off-chain indexers and relayers can verify the intended
-//! destination chain before executing a transfer. Transaction-level uniqueness
-//! is provided by the Stellar ledger's sequence-number mechanism; this
-//! contract does not maintain a per-operation nonce.
+//! destination chain before executing a transfer.
+//!
+//! For outbound withdrawals, callers must also supply a unique 32-byte
+//! `message_id`. The contract stores every processed withdrawal `message_id`
+//! and rejects duplicates, preventing the same off-chain bridge instruction
+//! from being recorded twice.
 //!
 //! ## Reentrancy
 //!
@@ -81,6 +84,8 @@ pub enum ContractError {
     AmountBelowMinimum = 12,
     /// Integer overflow in accounting arithmetic.
     Overflow = 13,
+    /// Withdrawal message ID has already been processed.
+    MessageAlreadyProcessed = 14,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -145,6 +150,8 @@ pub struct BridgeWithdrawalEvent {
     pub bridge_id: String,
     /// Remote chain identifier (for replay-protection verification).
     pub network_id: u32,
+    /// Unique identifier for the off-chain bridge message being settled.
+    pub message_id: BytesN<32>,
     /// Address to receive the withdrawn tokens on the destination chain.
     pub recipient: Address,
     /// Gross withdrawal amount.
@@ -218,6 +225,8 @@ pub enum DataKey {
     Bridge(String),
     /// Ordered list of all registered bridge IDs (instance storage).
     BridgeList,
+    /// Withdrawal message IDs that have already been processed.
+    ProcessedWithdrawal(BytesN<32>),
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -486,18 +495,22 @@ impl BridgeContract {
     /// * [`ContractError::AmountNotPositive`] – `amount` ≤ 0.
     /// * [`ContractError::BridgeNotFound`] – no bridge with this ID.
     /// * [`ContractError::AmountBelowMinimum`] – `amount < cfg.min_amount`.
+    /// * [`ContractError::MessageAlreadyProcessed`] – `message_id` was already used.
     /// * [`ContractError::Overflow`] – accounting overflow.
     ///
     /// # Security
     /// Authorization requires either the admin or the designated relayer address
     /// (set via [`set_relayer`]). The `recipient` is recorded in the event; this
-    /// contract does **not** transfer tokens. Relayers MUST verify the emitted
-    /// `network_id` matches the intended destination chain before executing any
-    /// off-chain token transfer to prevent cross-chain replay.
+    /// contract does **not** transfer tokens. `message_id` must be unique per
+    /// bridge instruction, and relayers MUST derive it from canonical source
+    /// chain data so the same withdrawal cannot be replayed with a fresh ID.
+    /// Relayers MUST also verify the emitted `network_id` matches the intended
+    /// destination chain before executing any off-chain token transfer.
     pub fn bridge_withdraw(
         env: Env,
         caller: Address,
         bridge_id: String,
+        message_id: BytesN<32>,
         recipient: Address,
         amount: i128,
     ) -> Result<(), ContractError> {
@@ -505,6 +518,13 @@ impl BridgeContract {
 
         if amount <= 0 {
             return Err(ContractError::AmountNotPositive);
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::ProcessedWithdrawal(message_id.clone()))
+        {
+            return Err(ContractError::MessageAlreadyProcessed);
         }
 
         let mut cfg = Self::load_bridge(&env, &bridge_id)?;
@@ -518,19 +538,24 @@ impl BridgeContract {
             .checked_add(amount)
             .ok_or(ContractError::Overflow)?;
         Self::save_bridge(&env, &bridge_id, &cfg);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ProcessedWithdrawal(message_id.clone()), &true);
 
         BridgeWithdrawalEvent {
             bridge_id: bridge_id.clone(),
             network_id: cfg.network_id,
+            message_id: message_id.clone(),
             recipient: recipient.clone(),
             amount,
         }
         .publish(&env);
         log!(
             &env,
-            "bridge_withdraw {} network_id={} -> {} amount={}",
+            "bridge_withdraw {} network_id={} message_id={} -> {} amount={}",
             bridge_id,
             cfg.network_id,
+            message_id,
             recipient,
             amount
         );
@@ -611,6 +636,13 @@ impl BridgeContract {
     /// Return the designated relayer address, or `None` if not set.
     pub fn get_relayer(env: Env) -> Option<Address> {
         env.storage().instance().get(&RELAYER_KEY)
+    }
+
+    /// Return whether a withdrawal `message_id` has already been processed.
+    pub fn is_withdrawal_processed(env: Env, message_id: BytesN<32>) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::ProcessedWithdrawal(message_id))
     }
 
     /// Compute the protocol fee for a given amount and fee rate.

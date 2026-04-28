@@ -15,9 +15,13 @@
 //!    query the close factor themselves.
 //!
 //! 3. The collateral seized by the liquidator is:
-//!    `collateral_seized = repay_amount * (10_000 + incentive_bps) / 10_000`.
-//!    It is further capped to the borrower's available collateral, preventing a
-//!    protocol-level panic even when the position is deeply insolvent.
+//!    `uncapped = repay_amount * (10_000 + incentive_bps) / 10_000`, then
+//!    **`collateral_seized = min(uncapped, collateral_balance)`** (enforced in
+//!    this module before debiting the borrower). The min-bound prevents
+//!    over-seizure when the incentive-scaled amount would otherwise exceed
+//!    on-chain collateral, e.g. after large oracle-denominated repricing or
+//!    when close-factor and maximum incentive combine to make `uncapped` large
+//!    relative to raw collateral.
 //!
 //! 4. After state changes a `PostLiquidationHealthEvent` is emitted carrying the
 //!    borrower's updated health factor. Off-chain monitors use this to detect
@@ -70,6 +74,7 @@ use crate::views::{
 /// liquidator including the incentive bonus.
 #[contractevent]
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct LiquidationEvent {
     /// Liquidator address
     pub liquidator: Address,
@@ -83,8 +88,10 @@ pub struct LiquidationEvent {
     pub repaid_amount: i128,
     /// Collateral seized by liquidator (includes incentive)
     pub collateral_seized: i128,
-    /// Ledger timestamp of the liquidation
-    pub timestamp: u64,
+    /// Debt repaid by the liquidator.
+    pub debt_repaid: i128,
+    /// Bad-debt event (if any shortfall was written off).
+    pub bad_debt_event: Option<BadDebtEvent>,
 }
 
 /// Emitted after every liquidation to surface updated position health.
@@ -94,6 +101,7 @@ pub struct LiquidationEvent {
 /// `HEALTH_FACTOR_NO_DEBT` means the debt was fully cleared.
 #[contractevent]
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct PostLiquidationHealthEvent {
     /// Borrower address
     pub borrower: Address,
@@ -107,16 +115,7 @@ pub struct PostLiquidationHealthEvent {
     pub timestamp: u64,
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Entry point
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Liquidate a borrower's position, repaying up to `amount` of their debt.
-///
-/// The call validates that the position is under-collateralised, clamps the
-/// repayment to the close-factor limit, computes collateral seized with the
-/// liquidation incentive, writes state changes, and emits both a
-/// `LiquidationEvent` and a `PostLiquidationHealthEvent`.
+/// Executes a normal liquidation of `borrower`'s `borrow_asset` position.
 ///
 /// # Arguments
 /// * `env` — Soroban contract environment.
@@ -144,98 +143,119 @@ pub struct PostLiquidationHealthEvent {
 /// - All arithmetic uses `I256` or `checked_*` / `saturating_*` variants.
 /// - Collateral seizure is capped to the borrower's balance, preventing
 ///   underflow even for deeply insolvent positions.
+#[allow(dead_code)]
 pub fn liquidate_position(
     env: &Env,
-    liquidator: Address,
-    borrower: Address,
-    debt_asset: Address,
-    collateral_asset: Address,
-    amount: i128,
-) -> Result<(), BorrowError> {
-    // ── 1. Pause / shutdown guard (before auth for fast fail) ──────────────
-    if is_paused(env, PauseType::Liquidation) || blocks_high_risk_ops(env) {
-        return Err(BorrowError::ProtocolPaused);
-    }
-
-    // ── 2. Input validation ────────────────────────────────────────────────
-    if amount <= 0 {
-        return Err(BorrowError::InvalidAmount);
-    }
-
-    // Auth is already required at the contract facade (lib.rs) before this
-    // function is called, so we do not call liquidator.require_auth() here.
-
-    // ── 3. Load borrower state ─────────────────────────────────────────────
-    let mut debt_position = get_debt_position(env, &borrower);
-    let accrued_interest = crate::borrow::calculate_interest(env, &debt_position);
-    // Settle interest into the position so we reason from a consistent total.
-    debt_position.interest_accrued = debt_position
-        .interest_accrued
-        .checked_add(accrued_interest)
-        .ok_or(BorrowError::Overflow)?;
-    debt_position.last_update = env.ledger().timestamp();
-
-    let total_debt = debt_position
-        .borrowed_amount
-        .checked_add(debt_position.interest_accrued)
-        .ok_or(BorrowError::Overflow)?;
-
-    // Verify asset match.
-    if debt_position.asset != debt_asset {
-        return Err(BorrowError::AssetNotSupported);
-    }
-
-    // Reject liquidation when there is no outstanding debt for this asset.
-    if total_debt == 0 {
-        return Err(BorrowError::InsufficientCollateral);
-    }
-    let mut collateral_position = get_collateral_position(env, &borrower);
-    if collateral_position.asset != collateral_asset {
-        return Err(BorrowError::AssetNotSupported);
-    }
-
-    // ── 5. Eligibility: position must be under-collateralised ──────────────
-    let cv = collateral_value(env, &collateral_position);
-    let dv = debt_value(env, &debt_position);
-    let hf_before = compute_health_factor(env, cv, dv, true);
-
-    // hf_before == 0 means no oracle price → cannot evaluate → reject.
-    if hf_before == 0 || hf_before >= HEALTH_FACTOR_SCALE {
-        return Err(BorrowError::InsufficientCollateral);
-    }
-
-    // ── 6. Apply close-factor cap ──────────────────────────────────────────
-    // max_liquidatable is already computed by the views module using the same
-    // oracle and close-factor, so reuse it to stay consistent.
-    let max_liq = get_max_liquidatable_amount(env, &borrower);
-    let repay_amount = if amount > max_liq { max_liq } else { amount };
-
+    _liquidator: &Address, // Would receive seized collateral in a production token-transfer impl.
+    borrower: &Address,
+    borrow_asset: &Address,
+    collateral_asset: &Address,
+    repay_amount: i128,
+) -> Result<LiquidationResult, LendingError> {
     if repay_amount <= 0 {
-        // max_liq returned 0 (position became healthy between read and now —
-        // shouldn't happen in single tx, but be defensive).
-        return Err(BorrowError::InsufficientCollateral);
+        return Err(LendingError::InvalidAmount);
     }
 
-    // ── 7. Collateral to seize (with incentive) ────────────────────────────
-    // Formula: repay_amount * (BPS_SCALE + incentive_bps) / BPS_SCALE
-    let collateral_to_seize = {
-        let raw = get_liquidation_incentive_amount(env, repay_amount);
-        // Cap to what the borrower actually has.
-        if raw > collateral_position.amount {
-            collateral_position.amount
+    // Guard: no new liquidations during shutdown (use emergency_liquidate).
+    if storage::is_shutdown(env) {
+        return Err(LendingError::EmergencyShutdown);
+    }
+
+    let borrow_market = storage::get_market(env, borrow_asset)?;
+    if !borrow_market.is_active {
+        return Err(LendingError::MarketNotFound);
+    }
+
+    let user_borrow = storage::get_user_borrow(env, borrower, borrow_asset);
+    if user_borrow == 0 {
+        return Err(LendingError::InvalidAmount);
+    }
+
+    // Verify position is unhealthy.
+    check_position_unhealthy(env, borrower, borrow_asset, collateral_asset)?;
+
+    // Apply close factor cap.
+    let max_repay = user_borrow
+        .checked_mul(CLOSE_FACTOR_BPS)
+        .ok_or(LendingError::InvalidAmount)?
+        / oracle::BPS_DENOM;
+    let actual_repay = repay_amount.min(max_repay);
+
+    // Compute collateral to seize (including liquidation bonus).
+    let bonus_bps = storage::get_liquidation_bonus(env, collateral_asset);
+    let collateral_seized = compute_collateral_seized(
+        env,
+        borrow_asset,
+        collateral_asset,
+        actual_repay,
+        bonus_bps,
+    )?;
+
+    let user_collateral = storage::get_user_deposit(env, borrower, collateral_asset);
+    let actual_seized = collateral_seized.min(user_collateral);
+
+    // Update positions.
+    let new_borrow = (user_borrow - actual_repay).max(0);
+    storage::set_user_borrow(env, borrower, borrow_asset, new_borrow);
+    storage::set_user_deposit(
+        env,
+        borrower,
+        collateral_asset,
+        (user_collateral - actual_seized).max(0),
+    );
+
+    // Update market totals.
+    let mut borrow_mkt = storage::get_market(env, borrow_asset)?;
+    borrow_mkt.total_borrows = (borrow_mkt.total_borrows - actual_repay).max(0);
+    storage::set_market(env, borrow_asset, &borrow_mkt);
+
+    let mut col_mkt = storage::get_market(env, collateral_asset)?;
+    col_mkt.total_deposits = (col_mkt.total_deposits - actual_seized).max(0);
+    storage::set_market(env, collateral_asset, &col_mkt);
+
+    // Check if partial liquidation left residual bad debt.
+    // (This happens only when actual_seized < collateral_seized, i.e. the
+    // borrower had less collateral than the bonus-adjusted repay amount.)
+    let bad_debt_event = if actual_seized < collateral_seized && new_borrow == 0 {
+        let seized_value = oracle::usd_value(env, collateral_asset, actual_seized)?;
+        let residual = (actual_repay - seized_value).max(0);
+        if residual > 0 {
+            Some(bad_debt_accounting::record_bad_debt(
+                env,
+                borrower,
+                borrow_asset,
+                residual,
+                actual_seized,
+            )?)
         } else {
-            raw
+            None
         }
+    } else {
+        None
     };
 
-    // ── 8. Update borrower debt (pay interest first, then principal) ────────
-    let mut remaining = repay_amount;
-    if remaining >= debt_position.interest_accrued {
-        remaining -= debt_position.interest_accrued;
-        debt_position.interest_accrued = 0;
-    } else {
-        debt_position.interest_accrued -= remaining;
-        remaining = 0;
+    Ok(LiquidationResult {
+        collateral_seized: actual_seized,
+        debt_repaid: actual_repay,
+        bad_debt_event,
+    })
+}
+
+/// Full liquidation regardless of close factor.  Used by governance during
+/// emergency shutdown.  Always writes off any residual shortfall.
+pub fn emergency_liquidate(
+    env: &Env,
+    borrower: &Address,
+    borrow_asset: &Address,
+    collateral_asset: &Address,
+) -> Result<LiquidationResult, LendingError> {
+    let user_borrow = storage::get_user_borrow(env, borrower, borrow_asset);
+    if user_borrow == 0 {
+        return Ok(LiquidationResult {
+            collateral_seized: 0,
+            debt_repaid: 0,
+            bad_debt_event: None,
+        });
     }
     // Remaining repayment reduces principal.
     debt_position.borrowed_amount = debt_position.borrowed_amount.saturating_sub(remaining);
@@ -244,6 +264,26 @@ pub fn liquidate_position(
     collateral_position.amount = collateral_position
         .amount
         .saturating_sub(collateral_to_seize);
+
+    // ── 9b. Bad debt accounting ────────────────────────────────────────────
+    // If collateral_to_seize < repay_amount, the shortfall is bad debt.
+    // Attempt to auto-offset from the insurance fund.
+    if collateral_to_seize < repay_amount {
+        let shortfall = repay_amount - collateral_to_seize;
+        let current_bad_debt = crate::borrow::get_total_bad_debt(env, &debt_asset);
+        let new_bad_debt = current_bad_debt.saturating_add(shortfall);
+
+        let fund_balance = crate::borrow::get_insurance_fund_balance(env, &debt_asset);
+        let (final_bad_debt, final_fund) = if fund_balance > 0 {
+            let offset = fund_balance.min(new_bad_debt);
+            (new_bad_debt - offset, fund_balance - offset)
+        } else {
+            (new_bad_debt, fund_balance)
+        };
+
+        crate::borrow::set_total_bad_debt(env, &debt_asset, final_bad_debt);
+        crate::borrow::set_insurance_fund_balance(env, &debt_asset, final_fund);
+    }
 
     // ── 10. Update global total debt ───────────────────────────────────────
     let current_total = get_total_debt(env);
@@ -265,35 +305,60 @@ pub fn liquidate_position(
     let hf_after = if remaining_debt == 0 {
         HEALTH_FACTOR_NO_DEBT
     } else {
-        compute_health_factor(env, post_cv, post_dv, true)
+        // No shortfall: manually zero the position and decrement totals.
+        let user_borrow_remaining = storage::get_user_borrow(env, borrower, borrow_asset);
+        storage::set_user_borrow(env, borrower, borrow_asset, 0);
+        let mut borrow_mkt = storage::get_market(env, borrow_asset)?;
+        borrow_mkt.total_borrows = (borrow_mkt.total_borrows - user_borrow_remaining).max(0);
+        storage::set_market(env, borrow_asset, &borrow_mkt);
+        None
     };
 
-    // Note: A partial close within the close factor is allowed to leave the position
-    // still under-water. If the liquidation incentive is extremely high (e.g. 100%),
-    // the health factor may legitimately decrease. Off-chain monitors must track
-    // the PostLiquidationHealthEvent to resolve deeply under-water positions across
-    // multiple calls.
+    Ok(LiquidationResult {
+        collateral_seized: user_collateral,
+        debt_repaid: user_borrow,
+        bad_debt_event,
+    })
+}
 
-    // ── 13. Emit events ────────────────────────────────────────────────────
-    LiquidationEvent {
-        liquidator: liquidator.clone(),
-        borrower: borrower.clone(),
-        debt_asset,
-        collateral_asset,
-        repaid_amount: repay_amount,
-        collateral_seized: collateral_to_seize,
-        timestamp: env.ledger().timestamp(),
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn check_position_unhealthy(
+    env: &Env,
+    borrower: &Address,
+    borrow_asset: &Address,
+    collateral_asset: &Address,
+) -> Result<(), LendingError> {
+    let user_borrow = storage::get_user_borrow(env, borrower, borrow_asset);
+    let user_deposit = storage::get_user_deposit(env, borrower, collateral_asset);
+    let cf_bps = storage::get_collateral_factor(env, collateral_asset);
+
+    let borrow_value = oracle::usd_value(env, borrow_asset, user_borrow)?;
+    let max_borrow = oracle::max_borrow_usd(env, collateral_asset, user_deposit, cf_bps)?;
+
+    if borrow_value <= max_borrow {
+        return Err(LendingError::PositionSolvent);
     }
-    .publish(env);
-
-    PostLiquidationHealthEvent {
-        borrower,
-        health_factor: hf_after,
-        remaining_debt,
-        remaining_collateral: collateral_position.amount,
-        timestamp: env.ledger().timestamp(),
-    }
-    .publish(env);
-
     Ok(())
+}
+
+fn compute_collateral_seized(
+    env: &Env,
+    borrow_asset: &Address,
+    collateral_asset: &Address,
+    repay_amount: i128,
+    bonus_bps: i128,
+) -> Result<i128, LendingError> {
+    let borrow_price = oracle::get_price(env, borrow_asset)?;
+    let collateral_price = oracle::get_price(env, collateral_asset)?;
+
+    // repay_amount expressed in collateral units, grossed up by bonus.
+    let seized = repay_amount
+        .checked_mul(borrow_price)
+        .ok_or(LendingError::InvalidAmount)?
+        .checked_mul(bonus_bps)
+        .ok_or(LendingError::InvalidAmount)?
+        / (collateral_price * oracle::BPS_DENOM);
+
+    Ok(seized)
 }

@@ -19,6 +19,13 @@ The reentrancy guard is strictly enforced on all token-interacting operations th
 - `withdraw_collateral`
 - `borrow_asset`
 - `repay_debt`
+- `liquidate`
+- `flash_loan`
+
+## Flash Loan Specifics
+For `flash_loan`, we enforce an additional layer of security beyond the standard `ReentrancyGuard`. We perform explicit pre- and post-callback state validation:
+1. **Balance Check**: The protocol's token balance must increase by at least the expected fee.
+2. **Protocol State Invariant**: Critical protocol metrics (`total_debt` and `total_deposits`) must remain unchanged during the external callback. This prevents attackers from "paying" for a flash loan by manipulating other protocol positions (e.g., via re-entry that would otherwise be blocked by the guard).
 
 ## Security Assumptions
 1. **Checks-Effects-Interactions (CEI)**: While we endeavor to apply the CEI pattern throughout the contract, the `ReentrancyGuard` guarantees safety even if state updates happen after external calls. By barring nested entries, all state transitions act atomically from the caller's perspective.

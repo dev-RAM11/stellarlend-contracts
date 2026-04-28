@@ -103,7 +103,7 @@ fn test_voting_flow() {
     );
 
     let current_time = env.ledger().timestamp();
-    env.ledger().set_timestamp(current_time + 1);
+    env.ledger().with_mut(|li| li.timestamp = current_time + 1);
 
     client.gov_vote(&voter1, &proposal_id, &VoteType::For);
     client.gov_vote(&voter2, &proposal_id, &VoteType::Against);

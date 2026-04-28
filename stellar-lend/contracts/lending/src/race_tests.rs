@@ -77,6 +77,8 @@ fn setup_race_test(
 
     // `initialize` sets the admin and borrow settings in one call.
     client.initialize(&admin, &1_000_000_000, &1000);
+    client.register_asset(&admin, &asset);
+    client.register_asset(&admin, &collateral_asset);
 
     // Deposit and withdraw settings are admin-gated; mock_all_auths satisfies auth.
     client.initialize_deposit_settings(&1_000_000_000, &100);
@@ -342,6 +344,8 @@ fn test_debt_ceiling_blocks_excessive_borrow() {
 
     // Initialize with a debt ceiling of exactly 5 000.
     client.initialize(&admin, &5_000, &1000);
+    client.register_asset(&admin, &asset);
+    client.register_asset(&admin, &collateral_asset);
     client.initialize_deposit_settings(&1_000_000_000, &100);
     client.initialize_withdraw_settings(&100);
 
@@ -383,6 +387,8 @@ fn test_deposit_cap_blocks_excess_deposit() {
     // Tight deposit cap of 10 000.
     client.initialize_deposit_settings(&10_000, &100);
     client.initialize_withdraw_settings(&100);
+    let admin2 = client.get_admin().unwrap();
+    client.register_asset(&admin2, &asset);
 
     // Fill the cap exactly.
     client.deposit(&user, &asset, &10_000);

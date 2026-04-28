@@ -42,6 +42,8 @@ pub enum PauseDataKey {
     Guardian,
     /// Current emergency lifecycle state.
     EmergencyState,
+    /// Protocol-level read-only mode flag.
+    ReadOnly,
 }
 
 /// Event data emitted on pause state change.
@@ -76,6 +78,16 @@ pub struct EmergencyStateEvent {
     pub to: EmergencyState,
     /// Caller that triggered transition.
     pub caller: Address,
+}
+
+/// Event emitted when read-only mode is toggled.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct ReadOnlyEvent {
+    /// New read-only state.
+    pub read_only: bool,
+    /// Admin who performed the action.
+    pub admin: Address,
 }
 
 /// Set the pause state for a specific operation type.
@@ -275,4 +287,24 @@ fn set_emergency_state(env: &Env, caller: Address, to: EmergencyState) {
         .persistent()
         .set(&PauseDataKey::EmergencyState, &to);
     EmergencyStateEvent { from, to, caller }.publish(env);
+}
+
+/// Enable or disable protocol-level read-only mode.
+///
+/// When active, all state-changing operations are blocked, but view functions
+/// remain fully accessible. This is a lightweight alternative to emergency
+/// shutdown for rapid incident response.
+pub fn set_read_only(env: &Env, admin: Address, read_only: bool) {
+    env.storage()
+        .persistent()
+        .set(&PauseDataKey::ReadOnly, &read_only);
+    ReadOnlyEvent { read_only, admin }.publish(env);
+}
+
+/// Return `true` if the protocol is currently in read-only mode.
+pub fn is_read_only(env: &Env) -> bool {
+    env.storage()
+        .persistent()
+        .get(&PauseDataKey::ReadOnly)
+        .unwrap_or(false)
 }

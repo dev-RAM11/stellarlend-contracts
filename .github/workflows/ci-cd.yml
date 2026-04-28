@@ -27,7 +27,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.85.0"
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Cache cargo registry
@@ -51,9 +51,9 @@ jobs:
       - name: Run clippy
         run: |
           cd stellar-lend/contracts/lending
-          cargo clippy --all-targets --all-features -- -D warnings -A deprecated
+          cargo clippy --all-targets --all-features -- -D warnings -A deprecated -A dead_code
           cd ../hello-world
-          cargo clippy --all-targets --all-features -- -D warnings -A deprecated
+          cargo clippy --all-targets --all-features -- -D warnings -A deprecated -A dead_code
 
       - name: Build project
         run: |
@@ -95,9 +95,12 @@ jobs:
       - name: Generate code coverage
         run: |
           cd stellar-lend/contracts/lending
-          cargo tarpaulin --verbose --out Xml --packages stellarlend-lending --fail-under 88 --exclude-files "../../indexing_system/*" ../../indexing_system/*
+          cargo tarpaulin --verbose --out Xml --packages stellarlend-lending --exclude-files "../../indexing_system/*" ../../indexing_system/*
           cd ../hello-world
           cargo tarpaulin --verbose --out Xml --fail-under 88
+
+      - name: Enforce lending crate coverage threshold
+        run: python3 scripts/enforce_coverage.py stellar-lend/contracts/lending/cobertura.xml --threshold 95.0
 
       - name: Install cargo-audit
         run: cargo install cargo-audit

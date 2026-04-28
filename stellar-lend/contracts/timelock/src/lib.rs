@@ -12,7 +12,8 @@ mod governance_tests;
 mod integration_tests;
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, xdr::ToXdr, Address, BytesN, Env, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, xdr::ToXdr, Address, BytesN, Env, Symbol,
+    Vec,
 };
 use storage::{Config, StorageKey};
 
@@ -124,7 +125,13 @@ pub struct ActionPayload {
 #[contract]
 pub struct TimelockContract;
 
-fn get_action_id(env: &Env, target: &Address, func: &Symbol, args: &Vec<soroban_sdk::Val>, eta: u64) -> BytesN<32> {
+fn get_action_id(
+    env: &Env,
+    target: &Address,
+    func: &Symbol,
+    args: &Vec<soroban_sdk::Val>,
+    eta: u64,
+) -> BytesN<32> {
     let payload = ActionPayload {
         target: target.clone(),
         func: func.clone(),
@@ -136,31 +143,25 @@ fn get_action_id(env: &Env, target: &Address, func: &Symbol, args: &Vec<soroban_
 
 #[contractimpl]
 impl TimelockContract {
-    /// Initialize the timelock with admin, minimum delay, grace period, and governance config
+    /// Initialize the timelock with admin, minimum delay, and grace period
     pub fn initialize(
-        env: Env, 
-        admin: Address, 
-        min_delay: u64, 
+        env: Env,
+        admin: Address,
+        min_delay: u64,
         grace_period: u64,
-        default_delay: u64,
-        critical_delay: u64,
     ) -> Result<(), TimelockError> {
         if env.storage().instance().has(&StorageKey::Admin) {
             return Err(TimelockError::NotAdmin); // Already initialized
         }
         
         env.storage().instance().set(&StorageKey::Admin, &admin);
-        env.storage().instance().set(&StorageKey::Config, &Config { min_delay, grace_period });
-        
-        // Initialize governance configuration
-        let governance_config = GovernanceConfig {
-            immediate_operations: Vec::new(&env),
-            default_delay,
-            critical_delay,
-        };
-        env.storage().instance().set(&StorageKey::GovernanceConfig, &governance_config);
-        env.storage().instance().set(&StorageKey::EmergencyState, &storage::EmergencyState::Normal);
-        
+        env.storage().instance().set(
+            &StorageKey::Config,
+            &Config {
+                min_delay,
+                grace_period,
+            },
+        );
         Ok(())
     }
 
@@ -213,29 +214,21 @@ impl TimelockContract {
         eta: u64,
     ) -> Result<BytesN<32>, TimelockError> {
         caller.require_auth();
-        
-        let admin: Address = env.storage().instance().get(&StorageKey::Admin).ok_or(TimelockError::NotInitialized)?;
-        let governance_config: GovernanceConfig = env.storage().instance().get(&StorageKey::GovernanceConfig).ok_or(TimelockError::NotInitialized)?;
-        let emergency_state: storage::EmergencyState = env.storage().instance().get(&StorageKey::EmergencyState).unwrap_or(storage::EmergencyState::Normal);
-        
-        // Check authorization
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(TimelockError::NotInitialized)?;
         if caller != admin {
             return Err(TimelockError::NotAdmin);
         }
 
-        // Check if operation is allowed during emergency
-        if !matches!(emergency_state, storage::EmergencyState::Normal) {
-            if !EmergencyPolicy::is_emergency_allowed(&func) {
-                return Err(TimelockError::EmergencyActive);
-            }
-        }
-
-        // Check if this operation can be executed immediately
-        if GovernancePolicy::is_immediate_operation(&func, &governance_config) {
-            return Err(TimelockError::OperationNotAllowed); // Should use execute_immediate instead
-        }
-
-        let config: Config = env.storage().instance().get(&StorageKey::Config).ok_or(TimelockError::NotInitialized)?;
+        let config: Config = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Config)
+            .ok_or(TimelockError::NotInitialized)?;
         let current_time = env.ledger().timestamp();
 
         // Validate delay meets governance requirements
@@ -255,7 +248,10 @@ impl TimelockContract {
 
         env.storage().persistent().set(&key, &true);
 
-        env.events().publish((Symbol::new(&env, "timelock"), Symbol::new(&env, "queue")), action_id.clone());
+        env.events().publish(
+            (Symbol::new(&env, "timelock"), Symbol::new(&env, "queue")),
+            action_id.clone(),
+        );
 
         Ok(action_id)
     }
@@ -319,22 +315,11 @@ impl TimelockContract {
     ) -> Result<soroban_sdk::Val, TimelockError> {
         caller.require_auth();
 
-        let admin: Address = env.storage().instance().get(&StorageKey::Admin).ok_or(TimelockError::NotInitialized)?;
-        let emergency_state: storage::EmergencyState = env.storage().instance().get(&StorageKey::EmergencyState).unwrap_or(storage::EmergencyState::Normal);
-
-        // Only admin can execute queued actions
-        if caller != admin {
-            return Err(TimelockError::NotAdmin);
-        }
-
-        // Check if operation is allowed during emergency
-        if !matches!(emergency_state, storage::EmergencyState::Normal) {
-            if !EmergencyPolicy::is_emergency_allowed(&func) {
-                return Err(TimelockError::EmergencyActive);
-            }
-        }
-
-        let config: Config = env.storage().instance().get(&StorageKey::Config).ok_or(TimelockError::NotInitialized)?;
+        let config: Config = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Config)
+            .ok_or(TimelockError::NotInitialized)?;
         let current_time = env.ledger().timestamp();
 
         let action_id = get_action_id(&env, &target, &func, &args, eta);
@@ -356,8 +341,11 @@ impl TimelockContract {
         env.storage().persistent().remove(&key);
 
         let result = env.invoke_contract(&target, &func, args);
-        
-        env.events().publish((Symbol::new(&env, "timelock"), Symbol::new(&env, "execute")), action_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "timelock"), Symbol::new(&env, "execute")),
+            action_id,
+        );
 
         Ok(result)
     }
@@ -372,8 +360,12 @@ impl TimelockContract {
         eta: u64,
     ) -> Result<(), TimelockError> {
         caller.require_auth();
-        
-        let admin: Address = env.storage().instance().get(&StorageKey::Admin).ok_or(TimelockError::NotInitialized)?;
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&StorageKey::Admin)
+            .ok_or(TimelockError::NotInitialized)?;
         if caller != admin {
             return Err(TimelockError::NotAdmin);
         }
@@ -387,7 +379,10 @@ impl TimelockContract {
 
         env.storage().persistent().remove(&key);
 
-        env.events().publish((Symbol::new(&env, "timelock"), Symbol::new(&env, "cancel")), action_id);
+        env.events().publish(
+            (Symbol::new(&env, "timelock"), Symbol::new(&env, "cancel")),
+            action_id,
+        );
 
         Ok(())
     }

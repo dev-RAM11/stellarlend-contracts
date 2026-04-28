@@ -61,7 +61,8 @@ To repay debt via `receive`, the user provides the payload `"repay"`, approves t
 3. **Pause Enforcement**: Unlike the earlier optimistic-receiver approach, `receive` now validates protocol pause state before any funds move, so paused operations stay paused.
 4. **Admin and Guardian Powers**: Admins can pause deposit/repay flows or trigger emergency lifecycle transitions through the normal protocol controls. Guardians do not have any special power over `receive` beyond the protocol-wide emergency states they can help initiate.
 5. **Reentrancy**: `receive` performs only a single token-contract call and then mutates local state; there is no callback path or user-supplied external call during processing.
-6. **Checked Arithmetic**: Deposits, debt accrual, and repayments continue to use checked arithmetic in the underlying borrow logic, so overflow paths are explicit and tested.
+6. **Deposit Cap Enforcement**: The `deposit` action in the `receive` hook is subject to the same global deposit cap as direct deposits. Transactions that would exceed the cap are rejected and any pending token transfers are rolled back.
+7. **Checked Arithmetic**: Deposits, debt accrual, and repayments continue to use checked arithmetic in the underlying borrow logic, so overflow paths are explicit and tested.
 
 ## Usage Example
 

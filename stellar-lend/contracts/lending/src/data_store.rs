@@ -100,7 +100,7 @@ pub enum DataStoreError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StoreKey {
     /// Marks the contract as initialised; value is the admin `Address`.
-    Admin,
+    StoreAdmin,
     /// Set of addresses granted write access by the admin.
     Writers,
     /// Current schema/migration version (u32).
@@ -142,11 +142,11 @@ impl DataStore {
     pub fn init(env: Env, admin: Address) {
         admin.require_auth();
 
-        if env.storage().persistent().has(&StoreKey::Admin) {
+        if env.storage().persistent().has(&StoreKey::StoreAdmin) {
             panic_with_error!(&env, DataStoreError::AlreadyInitialized);
         }
 
-        env.storage().persistent().set(&StoreKey::Admin, &admin);
+        env.storage().persistent().set(&StoreKey::StoreAdmin, &admin);
         env.storage()
             .persistent()
             .set(&StoreKey::SchemaVersion, &0u32);
@@ -559,14 +559,14 @@ impl DataStore {
         Self::assert_initialized(&env);
         env.storage()
             .persistent()
-            .get(&StoreKey::Admin)
+            .get(&StoreKey::StoreAdmin)
             .unwrap_or_else(|| panic_with_error!(&env, DataStoreError::NotInitialized))
     }
 
     /// Return `true` if `address` is the admin or a granted writer.
     #[allow(dead_code)]
     pub fn is_writer(env: Env, address: Address) -> bool {
-        if !env.storage().persistent().has(&StoreKey::Admin) {
+        if !env.storage().persistent().has(&StoreKey::StoreAdmin) {
             return false;
         }
         if Self::get_admin(env.clone()) == address {
@@ -586,7 +586,7 @@ impl DataStore {
 
     /// Panic with `NotInitialized` if the contract has not been `init`-ed.
     fn assert_initialized(env: &Env) {
-        if !env.storage().persistent().has(&StoreKey::Admin) {
+        if !env.storage().persistent().has(&StoreKey::StoreAdmin) {
             panic_with_error!(env, DataStoreError::NotInitialized);
         }
     }
@@ -596,7 +596,7 @@ impl DataStore {
         let admin: Address = env
             .storage()
             .persistent()
-            .get(&StoreKey::Admin)
+            .get(&StoreKey::StoreAdmin)
             .unwrap_or_else(|| panic_with_error!(env, DataStoreError::NotInitialized));
 
         if *caller != admin {
@@ -609,7 +609,7 @@ impl DataStore {
         let admin: Address = env
             .storage()
             .persistent()
-            .get(&StoreKey::Admin)
+            .get(&StoreKey::StoreAdmin)
             .unwrap_or_else(|| panic_with_error!(env, DataStoreError::NotInitialized));
 
         if *caller == admin {

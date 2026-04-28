@@ -1,7 +1,7 @@
 use soroban_sdk::{Address, Env};
 pub use stellarlend_amm::{
-    AmmCallbackData, AmmError, AmmProtocolConfig, AmmSettings, LiquidityParams, MockAmm, SwapParams,
-    TokenPair, AmmContract, AmmContractClient
+    AmmCallbackData, AmmContract, AmmContractClient, AmmError, AmmProtocolConfig, AmmSettings,
+    LiquidityParams, MockAmm, SwapParams, TokenPair,
 };
 
 /// Initialize AMM settings (admin only)
@@ -10,6 +10,9 @@ pub fn initialize_amm(
     admin: Address,
     default_slippage: i128,
     max_slippage: i128,
+    max_price_divergence: i128,
+    oracle_address: Option<Address>,
+    native_asset_address: Option<Address>,
     auto_swap_threshold: i128,
 ) -> Result<(), AmmError> {
     stellarlend_amm::initialize_amm_settings(
@@ -17,6 +20,9 @@ pub fn initialize_amm(
         admin,
         default_slippage,
         max_slippage,
+        max_price_divergence,
+        oracle_address,
+        native_asset_address,
         auto_swap_threshold,
     )
 }

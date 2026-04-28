@@ -14,9 +14,10 @@ use crate::events::{
     emit_admin_action, emit_borrow, emit_borrower_health_v1, emit_deposit,
     emit_flash_loan_initiated, emit_flash_loan_repaid, emit_liquidation, emit_liquidation_v1,
     emit_pause_state_changed, emit_price_updated, emit_repay, emit_risk_params_updated,
-    emit_withdrawal, AdminActionEvent, BorrowEvent, BorrowerHealthEventV1, DepositEvent,
-    FlashLoanInitiatedEvent, FlashLoanRepaidEvent, LiquidationEvent, LiquidationEventV1,
-    PauseStateChangedEvent, PriceUpdatedEvent, RepayEvent, RiskParamsUpdatedEvent, WithdrawalEvent,
+    emit_schema_version, emit_withdrawal, AdminActionEvent, BorrowEvent, BorrowerHealthEventV1,
+    DepositEvent, FlashLoanInitiatedEvent, FlashLoanRepaidEvent, LiquidationEvent,
+    LiquidationEventV1, PauseStateChangedEvent, PriceUpdatedEvent, RepayEvent,
+    RiskParamsUpdatedEvent, SchemaVersionEvent, WithdrawalEvent, EVENT_SCHEMA_VERSION,
 };
 
 use crate::{HelloContract, HelloContractClient};
@@ -169,6 +170,14 @@ pub struct TestPauseStateChangedEvent {
     pub actor: Address,
     pub operation: Symbol,
     pub paused: bool,
+    pub timestamp: u64,
+}
+
+/// Mirror of `SchemaVersionEvent` for test decoding.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct TestSchemaVersionEvent {
+    pub version: u32,
     pub timestamp: u64,
 }
 
@@ -421,7 +430,7 @@ fn test_liquidation_event_v1_structure() {
         emit_liquidation_v1(
             &env,
             LiquidationEventV1 {
-                schema_version: 1,
+                schema_version: EVENT_SCHEMA_VERSION,
                 liquidator: liquidator.clone(),
                 borrower: borrower.clone(),
                 debt_asset: None,
@@ -445,8 +454,7 @@ fn test_liquidation_event_v1_structure() {
         let decoded: TestLiquidationEventV1 =
             TestLiquidationEventV1::try_from_val(&env, &data).expect("decode liquidation v1");
 
-        assert_eq!(decoded.schema_version, 1);
-        assert_eq!(decoded.liquidator, liquidator);
+        assert_eq!(decoded.schema_version, EVENT_SCHEMA_VERSION);
         assert_eq!(decoded.borrower, borrower);
         assert_eq!(decoded.borrower_total_debt_after, 525);
         assert_eq!(decoded.borrower_health_factor_after, 8571);
@@ -467,7 +475,7 @@ fn test_borrower_health_event_v1_structure() {
         emit_borrower_health_v1(
             &env,
             BorrowerHealthEventV1 {
-                schema_version: 1,
+                schema_version: EVENT_SCHEMA_VERSION,
                 user: user.clone(),
                 operation: Symbol::new(&env, "liquidate"),
                 collateral: 900,
@@ -488,7 +496,7 @@ fn test_borrower_health_event_v1_structure() {
             TestBorrowerHealthEventV1::try_from_val(&env, &data)
                 .expect("decode borrower health event");
 
-        assert_eq!(decoded.schema_version, 1);
+        assert_eq!(decoded.schema_version, EVENT_SCHEMA_VERSION);
         assert_eq!(decoded.user, user);
         assert_eq!(decoded.operation, Symbol::new(&env, "liquidate"));
         assert_eq!(decoded.total_debt, 900);
@@ -1038,4 +1046,117 @@ fn test_event_sequence_deposit_borrow_repay() {
         after_repay >= after_borrow,
         "Repay should emit additional events"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Schema versioning tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `emit_schema_version` emits a `SchemaVersionEvent` carrying the current
+/// `EVENT_SCHEMA_VERSION` constant so indexers can anchor their decoding path.
+#[test]
+fn test_schema_version_event_emitted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(HelloContract, ());
+
+    env.as_contract(&contract_id, || {
+        emit_schema_version(&env, 42_u64);
+
+        let all = env.events().all();
+        assert_eq!(all.len(), 1, "Expected exactly one SchemaVersionEvent");
+
+        let (_c, _t, data) = all.get_unchecked(0);
+        let decoded: TestSchemaVersionEvent =
+            TestSchemaVersionEvent::try_from_val(&env, &data)
+                .expect("decode SchemaVersionEvent");
+
+        assert_eq!(
+            decoded.version, EVENT_SCHEMA_VERSION,
+            "version must equal EVENT_SCHEMA_VERSION constant"
+        );
+        assert_eq!(decoded.timestamp, 42_u64);
+    });
+}
+
+/// Versioned events (`LiquidationEventV1`, `BorrowerHealthEventV1`) must carry
+/// `schema_version == EVENT_SCHEMA_VERSION`. This test guards against
+/// accidental hardcoding that would diverge from the constant.
+#[test]
+fn test_versioned_events_carry_current_schema_version() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(HelloContract, ());
+
+    env.as_contract(&contract_id, || {
+        let liquidator = Address::generate(&env);
+        let borrower = Address::generate(&env);
+
+        emit_liquidation_v1(
+            &env,
+            LiquidationEventV1 {
+                schema_version: EVENT_SCHEMA_VERSION,
+                liquidator: liquidator.clone(),
+                borrower: borrower.clone(),
+                debt_asset: None,
+                collateral_asset: None,
+                debt_liquidated: 100,
+                collateral_seized: 110,
+                incentive_amount: 10,
+                borrower_collateral_after: 890,
+                borrower_principal_debt_after: 900,
+                borrower_interest_after: 0,
+                borrower_total_debt_after: 900,
+                borrower_health_factor_after: 9_888,
+                borrower_risk_level_after: 1,
+                timestamp: 1,
+            },
+        );
+
+        let all = env.events().all();
+        let (_c, _t, data) = all.get_unchecked(0);
+        let decoded: TestLiquidationEventV1 =
+            TestLiquidationEventV1::try_from_val(&env, &data).expect("decode LiquidationEventV1");
+
+        assert_eq!(
+            decoded.schema_version, EVENT_SCHEMA_VERSION,
+            "LiquidationEventV1.schema_version must equal EVENT_SCHEMA_VERSION"
+        );
+    });
+
+    let env2 = Env::default();
+    env2.mock_all_auths();
+    let contract_id2 = env2.register(HelloContract, ());
+
+    env2.as_contract(&contract_id2, || {
+        let user = Address::generate(&env2);
+
+        emit_borrower_health_v1(
+            &env2,
+            BorrowerHealthEventV1 {
+                schema_version: EVENT_SCHEMA_VERSION,
+                user: user.clone(),
+                operation: Symbol::new(&env2, "deposit"),
+                collateral: 1_000,
+                principal_debt: 0,
+                borrow_interest: 0,
+                total_debt: 0,
+                health_factor: i128::MAX,
+                risk_level: 1,
+                is_liquidatable: false,
+                timestamp: 2,
+            },
+        );
+
+        let all = env2.events().all();
+        let (_c, _t, data) = all.get_unchecked(0);
+        let decoded: TestBorrowerHealthEventV1 =
+            TestBorrowerHealthEventV1::try_from_val(&env2, &data)
+                .expect("decode BorrowerHealthEventV1");
+
+        assert_eq!(
+            decoded.schema_version, EVENT_SCHEMA_VERSION,
+            "BorrowerHealthEventV1.schema_version must equal EVENT_SCHEMA_VERSION"
+        );
+    });
 }

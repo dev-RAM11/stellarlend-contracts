@@ -17,6 +17,9 @@
 //! - Sequential liquidations converge
 //! - Global total debt decremented
 //! - Accrued interest included in liquidatable debt
+//! - **Liquidation bonus cap:** `collateral_seized <= min(uncapped_incentive_amount,
+//!   pre_liquidation_collateral_balance)` (see `liquidate.rs` module docs; enforced
+//!   after oracle-driven eligibility and close-factor clamping of `repay_amount`)
 
 use super::*;
 use soroban_sdk::{
@@ -37,6 +40,32 @@ impl LiqMockOracle {
     pub fn price(_env: Env, _asset: Address) -> i128 {
         100_000_000
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-asset legacy oracle: prices in instance storage (set from tests via
+// `Env::as_contract` — same pattern as `oracle_test::write_feed_at`).
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[contract]
+pub struct LiqStorageOracle;
+
+#[contractimpl]
+impl LiqStorageOracle {
+    /// Reads per-asset 8-decimal price; default 1.0 if unset.
+    pub fn price(env: Env, asset: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get::<Address, i128>(&asset)
+            .unwrap_or(100_000_000)
+    }
+}
+
+/// Set legacy `price` data for `asset` on a `LiqStorageOracle` contract id.
+fn set_liq_oracle_price(env: &Env, oracle: &Address, asset: &Address, price: i128) {
+    env.as_contract(oracle, || {
+        env.storage().instance().set(&asset, &price);
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -273,16 +302,16 @@ fn test_liquidate_reduces_total_debt() {
     let (client, admin, borrower, asset, collateral_asset) = setup_liquidatable(&env);
     create_underwater_position(&client, &borrower, &asset, &collateral_asset);
 
-    // Capture global total debt before liquidation
-    let total_debt_before = crate::borrow::get_total_debt(&env);
+    // Capture user debt before liquidation (proxy for global debt in single-user test)
+    let debt_before = client.get_debt_balance(&borrower);
 
     client.set_close_factor_bps(&admin, &10_000);
     let liquidator = Address::generate(&env);
     client.liquidate(&liquidator, &borrower, &asset, &collateral_asset, &5_000);
 
-    // Global total debt should be reduced by the principal repaid (5_000)
-    let total_debt_after = crate::borrow::get_total_debt(&env);
-    assert_eq!(total_debt_before - total_debt_after, 5_000);
+    // User debt should be reduced by 5_000
+    let debt_after = client.get_debt_balance(&borrower);
+    assert_eq!(debt_before - debt_after, 5_000);
 
     // Borrower's remaining principal should also be 5_000
     let debt = client.get_user_debt(&borrower);
@@ -577,4 +606,90 @@ fn test_liquidate_max_incentive_100pct() {
     // Expected: 3_000 * 2 = 6_000, but cap at 15_000 available → 6_000
     let expected = repay * 2;
     assert_eq!(seized, expected.min(collateral_before));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Regression: bonus × close factor never pays more collateral than on-chain
+// (extreme oracle move + partial liquidation) — enforces `min(raw, balance)`
+// in `liquidate_position` (see `liquidate.rs` doc and implementation).
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_liquidate_bonus_never_exceeds_collateral_extreme_oracle_and_close_factor() {
+    let env = Env::default();
+    env.mock_all_auths();
+    const PRICE_UNITY: i128 = 100_000_000;
+    // Collateral crashes to 1% of the debt-asset notional (8-decimal price).
+    const PRICE_COLLAT_CRASH: i128 = 1_000_000;
+
+    let contract_id = env.register(LendingContract, ());
+    let client = LendingContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let borrower = Address::generate(&env);
+    let debt_asset = Address::generate(&env);
+    let collateral_asset = Address::generate(&env);
+
+    client.initialize(&admin, &1_000_000_000, &1000);
+
+    let oracle_id = env.register(LiqStorageOracle, ());
+    set_liq_oracle_price(&env, &oracle_id, &debt_asset, PRICE_UNITY);
+    set_liq_oracle_price(&env, &oracle_id, &collateral_asset, PRICE_UNITY);
+    client.set_oracle(&admin, &oracle_id);
+
+    // 80% liq. threshold: position is healthy at equal $1 / $1 notionals, then
+    // becomes liquidatable when collateral price collapses.
+    client.set_liquidation_threshold_bps(&admin, &8000);
+    // 150% min CR: 10_000 debt ⇒ 15_000 collateral (use 15_001 to keep headroom for rounding).
+    const DEBT: i128 = 10_000;
+    const COL_RAW: i128 = 15_001;
+    client.borrow(&borrower, &debt_asset, &DEBT, &collateral_asset, &COL_RAW);
+
+    assert!(
+        client.get_health_factor(&borrower) >= HEALTH_FACTOR_SCALE,
+        "pre-crash: position must not be liquidatable at identical oracle prices"
+    );
+
+    // Collateral notional flash-crashes; debt oracle unchanged. Health drops hard.
+    set_liq_oracle_price(
+        &env,
+        &oracle_id,
+        &collateral_asset,
+        PRICE_COLLAT_CRASH,
+    );
+    let hf = client.get_health_factor(&borrower);
+    assert!(hf < HEALTH_FACTOR_SCALE);
+    assert!(hf > 0, "valid prices should yield a non-zero HF for partial liquidation test");
+
+    // Close factor 90% ⇒ partial: max one-shot repay 9_000. Incentive 100% ⇒
+    // uncapped seize = 18_000 raw units > 15_001 collateral (requires min-bound).
+    client.set_liquidation_incentive_bps(&admin, &10_000);
+    client.set_close_factor_bps(&admin, &9000);
+
+    let max_liq = client.get_max_liquidatable_amount(&borrower);
+    assert_eq!(max_liq, 9_000, "9_000 = floor(10_000 * 9000 / 10_000)");
+
+    let uncapped = client.get_liquidation_incentive_amount(&max_liq);
+    let collateral_before = client.get_collateral_balance(&borrower);
+    assert!(
+        uncapped > collateral_before,
+        "uncapped bonus path must exceed on-chain collateral so the min() bound is the real guard"
+    );
+
+    let liquidator = Address::generate(&env);
+    client.liquidate(
+        &liquidator,
+        &borrower,
+        &debt_asset,
+        &collateral_asset,
+        &(max_liq + 1_000_000),
+    );
+
+    let collateral_after = client.get_collateral_balance(&borrower);
+    let seized = collateral_before - collateral_after;
+    // Exact bound: collateral_seized = min(uncapped, collateral_before); see liquidate.rs.
+    assert_eq!(seized, uncapped.min(collateral_before));
+    assert_eq!(seized, collateral_before);
+    assert_eq!(seized, COL_RAW);
+    assert_eq!(collateral_after, 0);
+    assert!(seized <= collateral_before);
 }

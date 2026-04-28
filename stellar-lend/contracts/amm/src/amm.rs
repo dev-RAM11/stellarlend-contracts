@@ -32,7 +32,6 @@ use soroban_sdk::{
     contracterror, contractevent, contracttype, Address, Env, IntoVal, Map, Symbol, Val, Vec, I256,
 };
 
-
 /// Errors that can occur during AMM operations
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -66,6 +65,8 @@ pub enum AmmError {
     MaxInputExceeded = 13,
     /// Contract has already been initialized
     AlreadyInitialized = 14,
+    /// Price divergence between AMM and oracle exceeds threshold
+    PriceDivergenceExceeded = 15,
 }
 
 /// Storage keys for AMM-related data
@@ -141,6 +142,12 @@ pub struct AmmSettings {
     pub default_slippage: i128,
     /// Maximum slippage allowed (in basis points)
     pub max_slippage: i128,
+    /// Maximum price divergence between AMM and oracle (in basis points)
+    pub max_price_divergence: i128,
+    /// Oracle contract address for price validation
+    pub oracle_address: Option<Address>,
+    /// Native asset address for price validation
+    pub native_asset_address: Option<Address>,
     /// Swap operations enabled
     pub swap_enabled: bool,
     /// Liquidity operations enabled
@@ -333,6 +340,10 @@ pub fn execute_swap(env: &Env, user: Address, params: SwapParams) -> Result<i128
 
     // Calculate effective price and fees
     let effective_price = calculate_effective_price(params.amount_in, amount_out)?;
+
+    // Validate price divergence against oracle
+    validate_price_divergence(env, &params, effective_price)?;
+
     let fees_paid = calculate_swap_fees(&protocol_config, params.amount_in)?;
 
     // Record swap in history
@@ -451,100 +462,115 @@ pub fn add_liquidity(env: &Env, user: Address, params: LiquidityParams) -> Resul
 /// * `deadline` - Operation deadline
 ///
 /// # Returns
-/// Returns tuple (amount_a, amount_b) received
-#[allow(clippy::too_many_arguments)]
-pub fn remove_liquidity(
-    env: &Env,
-    user: Address,
-    protocol: Address,
-    token_a: Option<Address>,
-    token_b: Option<Address>,
-    lp_tokens: i128,
-    min_amount_a: i128,
-    min_amount_b: i128,
-    deadline: u64,
-) -> Result<(i128, i128), AmmError> {
-    user.require_auth();
+    /// Returns tuple (amount_a, amount_b) received
+    #[allow(clippy::too_many_arguments)]
+    pub fn remove_liquidity(
+        env: &Env,
+        user: Address,
+        protocol: Address,
+        token_a: Option<Address>,
+        token_b: Option<Address>,
+        lp_tokens: i128,
+        min_amount_a: i128,
+        min_amount_b: i128,
+        deadline: u64,
+    ) -> Result<(i128, i128), AmmError> {
+        user.require_auth();
 
-    // Check if liquidity operations are enabled
-    check_liquidity_enabled(env)?;
+        // Check if liquidity operations are enabled
+        check_liquidity_enabled(env)?;
 
-    // Check deadline
-    if env.ledger().timestamp() > deadline {
-        return Err(AmmError::SlippageExceeded);
+        // Check deadline
+        if env.ledger().timestamp() > deadline {
+            return Err(AmmError::SlippageExceeded);
+        }
+
+        // Validate parameters
+        if lp_tokens <= 0 {
+            return Err(AmmError::InvalidSwapParams);
+        }
+
+        // Get AMM protocol configuration
+        let protocol_config = get_amm_protocol_config(env, &protocol)?;
+
+        // Validate token pair is supported and use canonical pair ordering.
+        let supported_pair = get_supported_pair(&protocol_config, &token_a, &token_b)?;
+
+        // Generate callback nonce
+        let nonce = generate_callback_nonce(env, &user)?;
+
+        // Prepare callback data
+        let callback_data = AmmCallbackData {
+            nonce,
+            operation: Symbol::new(env, "remove_liquidity"),
+            user: user.clone(),
+            expected_amounts: {
+                let mut amounts = Vec::new(env);
+                amounts.push_back(min_amount_a);
+                amounts.push_back(min_amount_b);
+                amounts
+            },
+            deadline,
+        };
+
+        // Execute liquidity removal through AMM protocol
+        let (amount_a, amount_b) = execute_amm_remove_liquidity(
+            env,
+            &protocol,
+            &supported_pair,
+            lp_tokens,
+            min_amount_a,
+            min_amount_b,
+            &callback_data,
+        )?;
+
+        // Validate minimum outputs
+        if amount_a < min_amount_a || amount_b < min_amount_b {
+            return Err(AmmError::MinOutputNotMet);
+        }
+
+        // Create params for recording
+        let params = LiquidityParams {
+            protocol: protocol.clone(),
+            token_a: supported_pair.token_a.clone(),
+            token_b: supported_pair.token_b.clone(),
+            amount_a,
+            amount_b,
+            min_amount_a,
+            min_amount_b,
+            deadline,
+        };
+
+        // Record liquidity operation
+        record_liquidity_operation(env, &user, Symbol::new(env, "remove"), &params, lp_tokens)?;
+
+        // Emit events
+        emit_liquidity_removed_event(env, &user, &params, lp_tokens);
+        emit_amm_operation_event(
+            env,
+            &user,
+            Symbol::new(env, "remove_liquidity"),
+            lp_tokens,
+            amount_a.saturating_add(amount_b),
+        );
+
+        Ok((amount_a, amount_b))
     }
 
-    // Validate parameters
-    if lp_tokens <= 0 {
-        return Err(AmmError::InvalidSwapParams);
+    /// Add a manual swap function that allows explicit slippage control
+    pub fn swap_with_slippage(
+        env: &Env,
+        user: Address,
+        params: SwapParams,
+    ) -> Result<i128, AmmError> {
+        // Enforce max slippage from settings
+        let settings = get_amm_settings(env)?;
+        if params.slippage_tolerance > settings.max_slippage {
+            return Err(AmmError::SlippageExceeded);
+        }
+        
+        execute_swap(env, user, params)
     }
-
-    // Get AMM protocol configuration
-    let protocol_config = get_amm_protocol_config(env, &protocol)?;
-
-    // Validate token pair is supported and use canonical pair ordering.
-    let supported_pair = get_supported_pair(&protocol_config, &token_a, &token_b)?;
-
-    // Generate callback nonce
-    let nonce = generate_callback_nonce(env, &user)?;
-
-    // Prepare callback data
-    let callback_data = AmmCallbackData {
-        nonce,
-        operation: Symbol::new(env, "remove_liquidity"),
-        user: user.clone(),
-        expected_amounts: {
-            let mut amounts = Vec::new(env);
-            amounts.push_back(min_amount_a);
-            amounts.push_back(min_amount_b);
-            amounts
-        },
-        deadline,
-    };
-
-    // Execute liquidity removal through AMM protocol
-    let (amount_a, amount_b) = execute_amm_remove_liquidity(
-        env,
-        &protocol,
-        &supported_pair,
-        lp_tokens,
-        min_amount_a,
-        min_amount_b,
-        &callback_data,
-    )?;
-
-    // Validate minimum outputs
-    if amount_a < min_amount_a || amount_b < min_amount_b {
-        return Err(AmmError::MinOutputNotMet);
-    }
-
-    // Create params for recording
-    let params = LiquidityParams {
-        protocol: protocol.clone(),
-        token_a: supported_pair.token_a.clone(),
-        token_b: supported_pair.token_b.clone(),
-        amount_a,
-        amount_b,
-        min_amount_a,
-        min_amount_b,
-        deadline,
-    };
-
-    // Record liquidity operation
-    record_liquidity_operation(env, &user, Symbol::new(env, "remove"), &params, lp_tokens)?;
-
-    // Emit events
-    emit_liquidity_removed_event(env, &user, &params, lp_tokens);
-    emit_amm_operation_event(
-        env,
-        &user,
-        Symbol::new(env, "remove_liquidity"),
-        lp_tokens,
-        amount_a.saturating_add(amount_b),
-    );
-
-    Ok((amount_a, amount_b))
-}
 
 /// Validates callback nonce, expiry, and protocol registration without requiring
 /// `caller` authorization.
@@ -813,6 +839,80 @@ pub(crate) fn calculate_effective_price(
         .ok_or(AmmError::Overflow)?;
 
     Ok(price)
+}
+
+/// Validate price divergence against oracle
+fn validate_price_divergence(
+    env: &Env,
+    params: &SwapParams,
+    effective_price: i128,
+) -> Result<(), AmmError> {
+    let settings = get_amm_settings(env)?;
+    
+    // Skip if oracle is not configured or divergence check is disabled
+    let oracle_address = match settings.oracle_address {
+        Some(addr) => addr,
+        None => return Ok(()),
+    };
+    
+    if settings.max_price_divergence <= 0 {
+        return Ok(());
+    }
+
+    // Fetch prices from oracle for token_in and token_out
+    // We assume the oracle has a get_price(asset: Address) -> i128 function
+    let price_in = if let Some(token_in) = &params.token_in {
+        env.invoke_contract::<i128>(&oracle_address, &Symbol::new(env, "get_price"), (token_in.clone(),).into_val(env))
+    } else if let Some(native_addr) = &settings.native_asset_address {
+        env.invoke_contract::<i128>(&oracle_address, &Symbol::new(env, "get_price"), (native_addr.clone(),).into_val(env))
+    } else {
+        return Ok(()); // Skip if we can't resolve native price easily here
+    };
+
+    let price_out = if let Some(token_out) = &params.token_out {
+        env.invoke_contract::<i128>(&oracle_address, &Symbol::new(env, "get_price"), (token_out.clone(),).into_val(env))
+    } else if let Some(native_addr) = &settings.native_asset_address {
+        env.invoke_contract::<i128>(&oracle_address, &Symbol::new(env, "get_price"), (native_addr.clone(),).into_val(env))
+    } else {
+        return Ok(());
+    };
+
+    if price_in <= 0 || price_out <= 0 {
+        return Err(AmmError::PriceDivergenceExceeded);
+    }
+
+    // oracle_price = price_in / price_out * 10^18 (to match effective_price scaling)
+    // Actually, effective_price = amount_out / amount_in * 10^18
+    // So we want to compare effective_price with (price_in / price_out) * 10^18 ?
+    // If I swap 1 BTC for 10 ETH: amount_in=1, amount_out=10. effective_price = 10 * 1e18.
+    // Oracle: price_btc = 60000, price_eth = 3000. Ratio = 60000/3000 = 20.
+    // Wait, effective_price is amount_out per unit of amount_in.
+    // amount_out = amount_in * (price_in / price_out)
+    // effective_price = amount_out / amount_in = price_in / price_out.
+    
+    let oracle_price = price_in
+        .checked_mul(1_000_000_000_000_000_000i128)
+        .and_then(|v| v.checked_div(price_out))
+        .ok_or(AmmError::Overflow)?;
+
+    // Calculate deviation: |effective - oracle| / oracle * 10000
+    let diff = if effective_price > oracle_price {
+        effective_price.checked_sub(oracle_price).ok_or(AmmError::Overflow)?
+    } else {
+        oracle_price.checked_sub(effective_price).ok_or(AmmError::Overflow)?
+    };
+
+    let divergence_bps = diff
+        .checked_mul(10000)
+        .ok_or(AmmError::Overflow)?
+        .checked_div(oracle_price)
+        .ok_or(AmmError::Overflow)?;
+
+    if divergence_bps > settings.max_price_divergence {
+        return Err(AmmError::PriceDivergenceExceeded);
+    }
+
+    Ok(())
 }
 
 /// Calculate swap fees
@@ -1273,6 +1373,9 @@ pub fn initialize_amm_settings(
     admin: Address,
     default_slippage: i128,
     max_slippage: i128,
+    max_price_divergence: i128,
+    oracle_address: Option<Address>,
+    native_asset_address: Option<Address>,
     auto_swap_threshold: i128,
 ) -> Result<(), AmmError> {
     admin.require_auth();
@@ -1289,6 +1392,9 @@ pub fn initialize_amm_settings(
     let settings = AmmSettings {
         default_slippage,
         max_slippage,
+        max_price_divergence,
+        oracle_address,
+        native_asset_address,
         swap_enabled: true,
         liquidity_enabled: true,
         auto_swap_threshold,

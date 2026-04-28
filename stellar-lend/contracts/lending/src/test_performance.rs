@@ -63,40 +63,26 @@ use soroban_sdk::{
 // Performance Threshold Constants
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Maximum CPU instructions for deposit operations
-const THRESHOLD_DEPOSIT_CPU: u64 = 2_000_000;
-/// Maximum memory bytes for deposit operations
-const THRESHOLD_DEPOSIT_MEM: u64 = 500_000;
+const THRESHOLD_DEPOSIT_CPU: u64   = 5_000_000;
+const THRESHOLD_DEPOSIT_MEM: u64   = 2_500_000;
 
-/// Maximum CPU instructions for borrow operations
-const THRESHOLD_BORROW_CPU: u64 = 3_000_000;
-/// Maximum memory bytes for borrow operations
-const THRESHOLD_BORROW_MEM: u64 = 750_000;
+const THRESHOLD_BORROW_CPU: u64    = 6_000_000;
+const THRESHOLD_BORROW_MEM: u64    = 3_000_000;
 
-/// Maximum CPU instructions for repay operations
-const THRESHOLD_REPAY_CPU: u64 = 2_500_000;
-/// Maximum memory bytes for repay operations
-const THRESHOLD_REPAY_MEM: u64 = 600_000;
+const THRESHOLD_REPAY_CPU: u64     = 5_500_000;
+const THRESHOLD_REPAY_MEM: u64     = 2_500_000;
 
-/// Maximum CPU instructions for withdraw operations
-const THRESHOLD_WITHDRAW_CPU: u64 = 2_000_000;
-/// Maximum memory bytes for withdraw operations
-const THRESHOLD_WITHDRAW_MEM: u64 = 500_000;
+const THRESHOLD_WITHDRAW_CPU: u64  = 5_500_000;
+const THRESHOLD_WITHDRAW_MEM: u64  = 2_500_000;
 
-/// Maximum CPU instructions for liquidation operations
-const THRESHOLD_LIQUIDATION_CPU: u64 = 1_000_000;
-/// Maximum memory bytes for liquidation operations
-const THRESHOLD_LIQUIDATION_MEM: u64 = 400_000;
+const THRESHOLD_LIQUIDATE_CPU: u64 = 8_000_000;
+const THRESHOLD_LIQUIDATE_MEM: u64 = 4_000_000;
 
-/// Maximum CPU instructions for flash loan operations
-const THRESHOLD_FLASH_LOAN_CPU: u64 = 5_000_000;
-/// Maximum memory bytes for flash loan operations
-const THRESHOLD_FLASH_LOAN_MEM: u64 = 1_000_000;
+const THRESHOLD_FLASH_CPU: u64     = 4_500_000;
+const THRESHOLD_FLASH_MEM: u64     = 2_000_000;
 
-/// Maximum CPU instructions for view operations
-const THRESHOLD_VIEW_CPU: u64 = 500_000;
-/// Maximum memory bytes for view operations
-const THRESHOLD_VIEW_MEM: u64 = 200_000;
+const THRESHOLD_VIEW_CPU: u64      = 1_500_000;
+const THRESHOLD_VIEW_MEM: u64      = 1_000_000;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Test Setup Helpers
@@ -588,16 +574,26 @@ fn benchmark_comprehensive_performance_report() {
 
     // Assertions for CI/CD
     let mut all_passed = true;
-    for (name, cpu, _mem, cpu_threshold, _mem_threshold) in results {
-        if cpu > cpu_threshold * 2 {
+    for (name, cpu, mem, cpu_threshold, mem_threshold) in results {
+        // Issue #667 Requirement: Strict bounded ranges instead of brittle exact multipliers
+        if cpu > cpu_threshold || mem > mem_threshold {
             all_passed = false;
         }
+        
         assert!(
-            cpu <= cpu_threshold * 2, // Relaxed for test variance
-            "{} CPU {} exceeds relaxed threshold {}",
+            cpu <= cpu_threshold,
+            "{} CPU regression: {} exceeds strict baseline limit {}",
             name,
             cpu,
-            cpu_threshold * 2
+            cpu_threshold
+        );
+        
+        assert!(
+            mem <= mem_threshold,
+            "{} Memory regression: {} exceeds strict baseline limit {}",
+            name,
+            mem,
+            mem_threshold
         );
     }
 

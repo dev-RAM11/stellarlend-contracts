@@ -8,25 +8,12 @@
 
 use crate::constants::{
     BPS_SCALE, DEFAULT_CLOSE_FACTOR_BPS, DEFAULT_LIQUIDATION_INCENTIVE_BPS,
-    DEFAULT_LIQUIDATION_THRESHOLD_BPS, MIN_COLLATERAL_RATIO_BPS,
+    DEFAULT_LIQUIDATION_THRESHOLD_BPS,
 };
 use crate::pause::{self, blocks_high_risk_ops, PauseType};
 use soroban_sdk::{contracterror, contractevent, contracttype, Address, Env, I256};
 
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum BorrowError {
-    InsufficientCollateral = 1,
-    DebtCeilingReached = 2,
-    ProtocolPaused = 3,
-    InvalidAmount = 4,
-    Overflow = 5,
-    Unauthorized = 6,
-    AssetNotSupported = 7,
-    BelowMinimumBorrow = 8,
-    RepayAmountTooHigh = 9,
-}
+pub use crate::errors::BorrowError;
 
 #[contracttype]
 #[derive(Clone)]
@@ -36,28 +23,35 @@ pub enum BorrowDataKey {
     BorrowUserCollateral(Address),
     BorrowTotalDebt,
     BorrowDebtCeiling,
-    BorrowMinAmount,
+    BorrowMinAmountPerAsset(Address),
     OracleAddress,
     LiquidationThresholdBps,
     CloseFactor,
     LiquidationIncentiveBps,
     InsuranceFundBalance(Address),
     TotalBadDebt(Address),
+    BorrowMinAmount,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct DebtPosition {
+    /// Schema `v1`: stable getter field for `get_user_debt`.
     pub borrowed_amount: i128,
+    /// Schema `v1`: stable getter field for `get_user_debt`.
     pub interest_accrued: i128,
+    /// Schema `v1`: stable getter field for `get_user_debt`.
     pub last_update: u64,
+    /// Schema `v1`: stable getter field for `get_user_debt`.
     pub asset: Address,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct BorrowCollateral {
+    /// Schema `v1`: stable getter field for `get_user_collateral`.
     pub amount: i128,
+    /// Schema `v1`: stable getter field for `get_user_collateral`.
     pub asset: Address,
 }
 
@@ -91,6 +85,14 @@ pub struct BadDebtEvent {
 
 #[contractevent]
 #[derive(Clone, Debug)]
+pub struct OracleSetEvent {
+    pub admin: Address,
+    pub oracle: Address,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug)]
 pub struct InsuranceFundEvent {
     pub asset: Address,
     pub amount: i128,
@@ -113,6 +115,9 @@ pub fn borrow(
     collateral_asset: Address,
     collateral_amount: i128,
 ) -> Result<(), BorrowError> {
+    crate::asset_registry::require_registered_asset(env, &asset)?;
+    crate::asset_registry::require_registered_asset(env, &collateral_asset)?;
+
     user.require_auth();
 
     if pause::is_paused(env, PauseType::Borrow) || blocks_high_risk_ops(env) {
@@ -124,7 +129,7 @@ pub fn borrow(
     }
 
     // Instance storage read (Cheap)
-    let min_borrow = get_min_borrow_amount(env);
+    let min_borrow = get_min_borrow_amount(env, &asset);
     if amount < min_borrow {
         return Err(BorrowError::BelowMinimumBorrow);
     }
@@ -166,6 +171,19 @@ pub fn borrow(
         return Err(BorrowError::DebtCeilingReached);
     }
 
+    // [Issue #492] Enforce deposit cap for new collateral
+    if collateral_amount > 0 {
+        let current_deposits = crate::deposit::get_total_deposits(env);
+        let cap = crate::deposit::get_deposit_cap(env);
+        let next_deposits = current_deposits
+            .checked_add(collateral_amount)
+            .ok_or(BorrowError::Overflow)?;
+        if next_deposits > cap {
+            return Err(BorrowError::ExceedsDepositCap);
+        }
+        crate::deposit::set_total_deposits(env, next_deposits);
+    }
+
     debt_position.borrowed_amount = debt_position
         .borrowed_amount
         .checked_add(amount)
@@ -187,7 +205,10 @@ pub fn borrow(
     Ok(())
 }
 
-fn get_min_borrow_amount(env: &Env) -> i128 {
+fn get_min_borrow_amount(env: &Env, asset: &Address) -> i128 {
+    if let Some(min) = env.storage().instance().get(&BorrowDataKey::BorrowMinAmountPerAsset(asset.clone())) {
+        return min;
+    }
     env.storage()
         .instance()
         .get(&BorrowDataKey::BorrowMinAmount)
@@ -237,6 +258,14 @@ pub fn set_oracle(env: &Env, admin: &Address, oracle: Address) -> Result<(), Bor
     env.storage()
         .instance()
         .set(&BorrowDataKey::OracleAddress, &oracle);
+
+    OracleSetEvent {
+        admin: admin.clone(),
+        oracle,
+        timestamp: env.ledger().timestamp(),
+    }
+    .publish(env);
+
     Ok(())
 }
 
@@ -425,7 +454,7 @@ pub(crate) fn validate_collateral_ratio(collateral: i128, borrow: i128) -> Resul
 pub fn get_user_debt(env: &Env, user: &Address) -> DebtPosition {
     let mut position = get_debt_position(env, user);
     let accrued = calculate_interest(env, &position);
-    // Intentional saturating add: We use saturating math here instead of checked_add to prevent 
+    // Intentional saturating add: We use saturating math here instead of checked_add to prevent
     // view queries from trapping in extreme edge cases (like a ledger extremely far into the future).
     // Trapping on view functions breaks frontend queries and node telemetry.
     position.interest_accrued = position.interest_accrued.saturating_add(accrued);
@@ -437,9 +466,22 @@ pub fn get_user_collateral(env: &Env, user: &Address) -> BorrowCollateral {
 }
 
 pub fn deposit(env: &Env, user: Address, asset: Address, amount: i128) -> Result<(), BorrowError> {
+    crate::asset_registry::require_registered_asset(env, &asset)?;
+
     if amount <= 0 {
         return Err(BorrowError::InvalidAmount);
     }
+    // [Issue #492] Enforce deposit cap
+    let current_deposits = crate::deposit::get_total_deposits(env);
+    let cap = crate::deposit::get_deposit_cap(env);
+    let next_deposits = current_deposits
+        .checked_add(amount)
+        .ok_or(BorrowError::Overflow)?;
+    if next_deposits > cap {
+        return Err(BorrowError::ExceedsDepositCap);
+    }
+    crate::deposit::set_total_deposits(env, next_deposits);
+
     let mut collateral_position = get_collateral_position(env, &user);
     if collateral_position.amount == 0 {
         collateral_position.asset = asset.clone();
@@ -463,6 +505,8 @@ pub fn deposit(env: &Env, user: Address, asset: Address, amount: i128) -> Result
 }
 
 pub fn repay(env: &Env, user: Address, asset: Address, amount: i128) -> Result<(), BorrowError> {
+    crate::asset_registry::require_registered_asset(env, &asset)?;
+
     if amount <= 0 {
         return Err(BorrowError::InvalidAmount);
     }
@@ -608,6 +652,9 @@ pub fn liquidate_position(
     _collateral_asset: Address,
     amount: i128,
 ) -> Result<(), BorrowError> {
+    crate::asset_registry::require_registered_asset(env, &debt_asset)?;
+    crate::asset_registry::require_registered_asset(env, &_collateral_asset)?;
+
     if amount <= 0 {
         return Err(BorrowError::InvalidAmount);
     }

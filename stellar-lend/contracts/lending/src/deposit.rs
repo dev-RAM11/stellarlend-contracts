@@ -2,17 +2,7 @@ use crate::pause::{self, PauseType};
 use soroban_sdk::{contracterror, contractevent, contracttype, Address, Env};
 
 /// Errors that can occur during deposit operations
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum DepositError {
-    InvalidAmount = 1,
-    DepositPaused = 2,
-    Overflow = 3,
-    AssetNotSupported = 4,
-    ExceedsDepositCap = 5,
-    Unauthorized = 6,
-}
+pub use crate::errors::DepositError;
 
 /// Storage keys for deposit-related data
 #[contracttype]
@@ -29,8 +19,11 @@ pub enum DepositDataKey {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct DepositCollateral {
+    /// Schema `v1`: stable getter field for `get_user_collateral_deposit`.
     pub amount: i128,
+    /// Schema `v1`: stable getter field for `get_user_collateral_deposit`.
     pub asset: Address,
+    /// Schema `v1`: stable getter field for `get_user_collateral_deposit`.
     pub last_deposit_time: u64,
 }
 
@@ -61,6 +54,9 @@ pub fn deposit(
     asset: Address,
     amount: i128,
 ) -> Result<i128, DepositError> {
+    crate::asset_registry::require_registered_asset(env, &asset)
+        .map_err(|_| DepositError::AssetNotSupported)?;
+
     user.require_auth();
 
     if pause::is_paused(env, PauseType::Deposit) {
@@ -137,24 +133,24 @@ fn save_deposit_position(env: &Env, user: &Address, position: &DepositCollateral
         .set(&DepositDataKey::UserCollateral(user.clone()), position);
 }
 
-fn get_total_deposits(env: &Env) -> i128 {
+pub(crate) fn get_total_deposits(env: &Env) -> i128 {
     env.storage()
         .persistent()
         .get(&DepositDataKey::TotalAmount)
         .unwrap_or(0)
 }
 
-fn set_total_deposits(env: &Env, amount: i128) {
-    env.storage()
-        .persistent()
-        .set(&DepositDataKey::TotalAmount, &amount);
-}
-
-fn get_deposit_cap(env: &Env) -> i128 {
+pub(crate) fn get_deposit_cap(env: &Env) -> i128 {
     env.storage()
         .persistent()
         .get(&DepositDataKey::CapAmount)
         .unwrap_or(i128::MAX)
+}
+
+pub(crate) fn set_total_deposits(env: &Env, amount: i128) {
+    env.storage()
+        .persistent()
+        .set(&DepositDataKey::TotalAmount, &amount);
 }
 
 fn get_min_deposit_amount(env: &Env) -> i128 {

@@ -28,6 +28,11 @@ pub struct Event {
     /// Event data as JSON (decoded event parameters)
     pub event_data: serde_json::Value,
 
+    /// Schema version extracted from the event payload (`schema_version` field),
+    /// or `None` for unversioned events. Indexers should use this to select the
+    /// correct decoding path when the contract is upgraded.
+    pub schema_version: Option<u32>,
+
     /// Timestamp when the event was indexed
     pub indexed_at: DateTime<Utc>,
 
@@ -55,6 +60,11 @@ pub struct CreateEvent {
 
     /// Event data
     pub event_data: serde_json::Value,
+
+    /// Schema version from the event payload, if present.
+    /// Populated by the parser when the decoded event data contains a
+    /// `schema_version` field (u32). `None` for legacy / unversioned events.
+    pub schema_version: Option<u32>,
 }
 
 /// Represents indexing progress for a contract
@@ -217,5 +227,33 @@ mod tests {
         let query = EventQuery::default();
         assert!(query.contract_address.is_none());
         assert_eq!(query.limit.unwrap(), 100);
+    }
+
+    #[test]
+    fn test_create_event_schema_version_present() {
+        let event = CreateEvent {
+            contract_address: "0xabc".to_string(),
+            event_name: "LiquidationEventV1".to_string(),
+            block_number: 100,
+            transaction_hash: "0xhash".to_string(),
+            log_index: 0,
+            event_data: serde_json::json!({"schema_version": 1}),
+            schema_version: Some(1),
+        };
+        assert_eq!(event.schema_version, Some(1));
+    }
+
+    #[test]
+    fn test_create_event_schema_version_absent_for_legacy_events() {
+        let event = CreateEvent {
+            contract_address: "0xabc".to_string(),
+            event_name: "Transfer".to_string(),
+            block_number: 50,
+            transaction_hash: "0xhash2".to_string(),
+            log_index: 1,
+            event_data: serde_json::json!({"from": "0x1", "to": "0x2", "value": "100"}),
+            schema_version: None,
+        };
+        assert!(event.schema_version.is_none());
     }
 }

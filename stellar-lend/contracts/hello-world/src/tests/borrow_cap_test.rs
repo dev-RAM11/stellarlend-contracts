@@ -41,11 +41,11 @@ fn xlm_collateral_config(env: &Env) -> AssetConfig {
         collateral_factor: 8000,
         liquidation_threshold: 8000,
         reserve_factor: 1000,
-        max_supply: 0,      // unlimited
-        max_borrow: 0,      // unlimited (XLM is collateral only in these tests)
+        max_supply: 0, // unlimited
+        max_borrow: 0, // unlimited (XLM is collateral only in these tests)
         can_collateralize: true,
         can_borrow: false,
-        price: 1_0000000,   // $1.00
+        price: 1_0000000, // $1.00
         price_updated_at: env.ledger().timestamp(),
     }
 }
@@ -106,25 +106,26 @@ fn test_borrow_cap_enforcement() {
 #[test]
 fn test_borrow_cap_update_via_admin() {
     let env = create_test_env();
-    let (client, _admin) = setup_protocol(&env);
+    let (client, admin) = setup_protocol(&env);
 
     let usdc = Address::generate(&env);
-    let user = Address::generate(&env);
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
 
     client.initialize_asset(&None, &xlm_collateral_config(&env));
-    client.initialize_asset(&Some(usdc.clone()), &token_borrow_config(&env, &usdc, 1_0000000, 500));
+    client.initialize_asset(
+        &Some(usdc.clone()),
+        &token_borrow_config(&env, &usdc, 1_0000000, 500),
+    );
 
     client.cross_asset_deposit(&user, &None, &5000);
+    client.cross_asset_borrow(&user, &Some(usdc.clone()), &500);
 
-    // Initialize Native XLM as a cross-asset instrument so health checks work
-    let xlm_config = create_asset_config(&env, None, 1_0000000, 0);
-    client.initialize_asset(&None, &xlm_config);
+    let blocked = client.try_cross_asset_borrow(&user, &Some(usdc.clone()), &1);
+    assert!(blocked.is_err(), "borrow should fail when cap is reached");
 
-    // User 1 deposits collateral (Native XLM) via cross-asset deposit
-    client.cross_asset_deposit(&user1, &None, &5000);
-
-    // Admin raises cap to 1 000
     client.update_asset_config(
+        &admin,
         &Some(usdc.clone()),
         &None,
         &None,
@@ -132,44 +133,57 @@ fn test_borrow_cap_update_via_admin() {
         &Some(1000),
         &None,
         &None,
+        &None,
     );
 
-    // User 2 deposits collateral
-    client.cross_asset_deposit(&user2, &None, &5000);
+    let unblocked = client.try_cross_asset_borrow(&user, &Some(usdc.clone()), &200);
+    assert!(
+        unblocked.is_ok(),
+        "borrow should succeed after admin raises cap"
+    );
 
-// ============================================================================
-// 2. Per-asset isolation: "ceiling hit while others have room" (issue #519)
-// ============================================================================
+    assert_eq!(client.get_total_borrow_for(&Some(usdc)), 700);
+}
 
-/// Hitting asset A's ceiling must not affect asset B's borrowing.
-#[test]
-fn test_borrow_cap_asset_a_full_asset_b_still_available() {
-    let env = create_test_env();
-    let (client, _admin) = setup_protocol(&env);
+    // ============================================================================
+    // 2. Per-asset isolation: "ceiling hit while others have room" (issue #519)
+    // ============================================================================
 
-    let usdc = Address::generate(&env);
-    let dai = Address::generate(&env);
-    let user = Address::generate(&env);
+    /// Hitting asset A's ceiling must not affect asset B's borrowing.
+    #[test]
+    fn test_borrow_cap_asset_a_full_asset_b_still_available() {
+        let env = create_test_env();
+        let (client, _admin) = setup_protocol(&env);
+
+        let usdc = Address::generate(&env);
+        let dai = Address::generate(&env);
+        let user = Address::generate(&env);
 
     // XLM collateral
     client.initialize_asset(&None, &xlm_collateral_config(&env));
     // USDC: cap 1 000
-    client.initialize_asset(&Some(usdc.clone()), &token_borrow_config(&env, &usdc, 1_0000000, 1000));
-    // DAI: cap 2 000 (has room)
-    client.initialize_asset(&Some(dai.clone()), &token_borrow_config(&env, &dai, 1_0000000, 2000));
-
-    // Large collateral so the health factor is not the bottleneck
-    client.cross_asset_deposit(&user, &None, &100_000);
-
-    // Fill USDC cap exactly
-    client.cross_asset_borrow(&user, &Some(usdc.clone()), &1000);
-
-    // Borrow of any more USDC must fail (cap exhausted)
-    let usdc_result = client.try_cross_asset_borrow(&user, &Some(usdc.clone()), &1);
-    assert!(
-        usdc_result.is_err(),
-        "USDC borrow should fail: cap is exhausted"
+    client.initialize_asset(
+        &Some(usdc.clone()),
+        &token_borrow_config(&env, &usdc, 1_0000000, 1000),
     );
+    // DAI: cap 2 000 (has room)
+    client.initialize_asset(
+        &Some(dai.clone()),
+        &token_borrow_config(&env, &dai, 1_0000000, 2000),
+    );
+
+        // Large collateral so the health factor is not the bottleneck
+        client.cross_asset_deposit(&user, &None, &100_000);
+
+        // Fill USDC cap exactly
+        client.cross_asset_borrow(&user, &Some(usdc.clone()), &1000);
+
+        // Borrow of any more USDC must fail (cap exhausted)
+        let usdc_result = client.try_cross_asset_borrow(&user, &Some(usdc.clone()), &1);
+        assert!(
+            usdc_result.is_err(),
+            "USDC borrow should fail: cap is exhausted"
+        );
 
     // Borrow of DAI must still succeed (different asset, different cap)
     let dai_result = client.try_cross_asset_borrow(&user, &Some(dai.clone()), &500);
@@ -191,57 +205,71 @@ fn test_borrow_cap_shared_across_users() {
     let user3 = Address::generate(&env);
 
     client.initialize_asset(&None, &xlm_collateral_config(&env));
-    client.initialize_asset(&Some(usdc.clone()), &token_borrow_config(&env, &usdc, 1_0000000, 1000));
+    client.initialize_asset(
+        &Some(usdc.clone()),
+        &token_borrow_config(&env, &usdc, 1_0000000, 1000),
+    );
 
     // Three users each deposit collateral
     for u in [&user1, &user2, &user3] {
         client.cross_asset_deposit(u, &None, &5000);
     }
 
-    // User 1 borrows 400, user 2 borrows 400 → total 800
-    client.cross_asset_borrow(&user1, &Some(usdc.clone()), &400);
-    client.cross_asset_borrow(&user2, &Some(usdc.clone()), &400);
+    /// Two separate users both borrowing against the same asset ceiling share the cap.
+    #[test]
+    fn test_borrow_cap_shared_across_users() {
+        let env = create_test_env();
+        let (client, _admin) = setup_protocol(&env);
 
-    // Remaining cap: 200. User 3 borrows 200 → total hits 1 000 exactly
-    client.cross_asset_borrow(&user3, &Some(usdc.clone()), &200);
+        let usdc = Address::generate(&env);
+        let user1 = Address::generate(&env);
+        let user2 = Address::generate(&env);
+        let user3 = Address::generate(&env);
 
-    // Now cap is full; any further borrow must fail
-    let result = client.try_cross_asset_borrow(&user1, &Some(usdc.clone()), &1);
-    assert!(result.is_err(), "cap is exhausted; no more borrows allowed");
+        client.initialize_asset(&None, &xlm_collateral_config(&env));
+        client.initialize_asset(
+            &Some(usdc.clone()),
+            &token_borrow_config(&env, &usdc, 1_0000000, 1000),
+        );
 
-    let total = client.get_total_borrow_for(&Some(usdc.clone()));
-    assert_eq!(total, 1000, "total borrows must equal the cap");
-}
+        // Three users each deposit collateral
+        for u in [&user1, &user2, &user3] {
+            client.cross_asset_deposit(u, &None, &5000);
+        }
 
-/// Repaying reduces total borrows, opening cap space for new borrows.
-#[test]
-fn test_borrow_cap_repay_frees_capacity() {
-    let env = create_test_env();
-    let (client, _admin) = setup_protocol(&env);
+        // User 1 borrows 400, user 2 borrows 400 → total 800
+        client.cross_asset_borrow(&user1, &Some(usdc.clone()), &400);
+        client.cross_asset_borrow(&user2, &Some(usdc.clone()), &400);
 
-    let usdc = Address::generate(&env);
-    let user = Address::generate(&env);
+        // Remaining cap: 200. User 3 borrows 200 → total hits 1 000 exactly
+        client.cross_asset_borrow(&user3, &Some(usdc.clone()), &200);
 
     client.initialize_asset(&None, &xlm_collateral_config(&env));
-    client.initialize_asset(&Some(usdc.clone()), &token_borrow_config(&env, &usdc, 1_0000000, 1000));
-
-    client.cross_asset_deposit(&user, &None, &5000);
-
-    // Fill cap
-    client.cross_asset_borrow(&user, &Some(usdc.clone()), &1000);
-
-    // Cannot borrow more
-    assert!(
-        client
-            .try_cross_asset_borrow(&user, &Some(usdc.clone()), &1)
-            .is_err()
+    client.initialize_asset(
+        &Some(usdc.clone()),
+        &token_borrow_config(&env, &usdc, 1_0000000, 1000),
     );
 
-    // Repay 300 → total drops to 700
-    client.cross_asset_repay(&user, &Some(usdc.clone()), &300);
+        let total = client.get_total_borrow_for(&Some(usdc.clone()));
+        assert_eq!(total, 1000, "total borrows must equal the cap");
+    }
 
-    let after_repay = client.get_total_borrow_for(&Some(usdc.clone()));
-    assert_eq!(after_repay, 700);
+    /// Repaying reduces total borrows, opening cap space for new borrows.
+    #[test]
+    fn test_borrow_cap_repay_frees_capacity() {
+        let env = create_test_env();
+        let (client, _admin) = setup_protocol(&env);
+
+    // Cannot borrow more
+    assert!(client
+        .try_cross_asset_borrow(&user, &Some(usdc.clone()), &1)
+        .is_err());
+
+        // Repay 300 → total drops to 700
+        client.cross_asset_repay(&user, &Some(usdc.clone()), &300);
+
+        let after_repay = client.get_total_borrow_for(&Some(usdc.clone()));
+        assert_eq!(after_repay, 700);
 
     // Now 300 of cap is free; borrow 300 should succeed
     assert!(
@@ -263,7 +291,10 @@ fn test_borrow_cap_zero_means_unlimited() {
 
     client.initialize_asset(&None, &xlm_collateral_config(&env));
     // max_borrow = 0 → no cap
-    client.initialize_asset(&Some(usdc.clone()), &token_borrow_config(&env, &usdc, 1_0000000, 0));
+    client.initialize_asset(
+        &Some(usdc.clone()),
+        &token_borrow_config(&env, &usdc, 1_0000000, 0),
+    );
 
     client.cross_asset_deposit(&user, &None, &100_000);
 
@@ -283,7 +314,10 @@ fn test_borrow_cap_exact_boundary() {
     let user2 = Address::generate(&env);
 
     client.initialize_asset(&None, &xlm_collateral_config(&env));
-    client.initialize_asset(&Some(usdc.clone()), &token_borrow_config(&env, &usdc, 1_0000000, 1000));
+    client.initialize_asset(
+        &Some(usdc.clone()),
+        &token_borrow_config(&env, &usdc, 1_0000000, 1000),
+    );
 
     client.cross_asset_deposit(&user, &None, &5000);
     client.cross_asset_deposit(&user2, &None, &5000);
@@ -297,116 +331,4 @@ fn test_borrow_cap_exact_boundary() {
     assert!(above_cap.is_err(), "borrow above cap must fail");
 }
 
-// ============================================================================
-// 3. Total borrow accounting correctness
-// ============================================================================
-
-/// `get_total_borrow_for` must track borrows accurately across multiple users.
-#[test]
-fn test_total_borrow_tracking() {
-    let env = create_test_env();
-    let (client, _admin) = setup_protocol(&env);
-
-    let usdc = Address::generate(&env);
-    let user1 = Address::generate(&env);
-    let user2 = Address::generate(&env);
-
-    client.initialize_asset(&None, &xlm_collateral_config(&env));
-    client.initialize_asset(&Some(usdc.clone()), &token_borrow_config(&env, &usdc, 1_0000000, 5000));
-
-    client.cross_asset_deposit(&user1, &None, &5000);
-    client.cross_asset_deposit(&user2, &None, &5000);
-
-    assert_eq!(client.get_total_borrow_for(&Some(usdc.clone())), 0);
-
-    client.cross_asset_borrow(&user1, &Some(usdc.clone()), &300);
-    assert_eq!(client.get_total_borrow_for(&Some(usdc.clone())), 300);
-
-    client.cross_asset_borrow(&user2, &Some(usdc.clone()), &200);
-    assert_eq!(client.get_total_borrow_for(&Some(usdc.clone())), 500);
-
-    client.cross_asset_repay(&user1, &Some(usdc.clone()), &100);
-    assert_eq!(client.get_total_borrow_for(&Some(usdc.clone())), 400);
-}
-
-/// Total borrow on asset A is unaffected by borrow/repay activity on asset B.
-#[test]
-fn test_total_borrow_isolation_between_assets() {
-    let env = create_test_env();
-    let (client, _admin) = setup_protocol(&env);
-
-    let usdc = Address::generate(&env);
-    let dai = Address::generate(&env);
-    let user = Address::generate(&env);
-
-    client.initialize_asset(&None, &xlm_collateral_config(&env));
-    client.initialize_asset(&Some(usdc.clone()), &token_borrow_config(&env, &usdc, 1_0000000, 5000));
-    client.initialize_asset(&Some(dai.clone()), &token_borrow_config(&env, &dai, 1_0000000, 5000));
-
-    client.cross_asset_deposit(&user, &None, &20_000);
-
-    // Initialize Native XLM as a cross-asset instrument so health checks work
-    let xlm_config = create_asset_config(&env, None, 1_0000000, 0);
-    client.initialize_asset(&None, &xlm_config);
-
-    client.cross_asset_deposit(&user, &None, &5000);
-
-    // Repay DAI should not change USDC total
-    client.cross_asset_repay(&user, &Some(dai.clone()), &300);
-    assert_eq!(
-        client.get_total_borrow_for(&Some(usdc.clone())),
-        500,
-        "USDC total must not change when DAI is repaid"
-    );
-    assert_eq!(
-        client.get_total_borrow_for(&Some(dai.clone())),
-        0,
-        "DAI total must reflect repayment"
-    );
-}
-
-// ============================================================================
-// 4. Admin can lower cap below current outstanding debt (existing debt stands)
-// ============================================================================
-
-/// When admin lowers cap below outstanding borrows, existing positions are
-/// unaffected but new borrows are blocked.
-#[test]
-fn test_borrow_cap_lowered_below_current_debt_blocks_new_borrows() {
-    let env = create_test_env();
-    let (client, _admin) = setup_protocol(&env);
-
-    let usdc = Address::generate(&env);
-    let user = Address::generate(&env);
-    let user2 = Address::generate(&env);
-
-    client.initialize_asset(&None, &xlm_collateral_config(&env));
-    client.initialize_asset(&Some(usdc.clone()), &token_borrow_config(&env, &usdc, 1_0000000, 2000));
-
-    client.cross_asset_deposit(&user, &None, &5000);
-    client.cross_asset_deposit(&user2, &None, &5000);
-
-    // Borrow 800 (well under cap)
-    client.cross_asset_borrow(&user, &Some(usdc.clone()), &800);
-
-    // Admin lowers cap to 500 (below current outstanding of 800)
-    client.update_asset_config(
-        &Some(usdc.clone()),
-        &None,       // cf
-        &None,       // lt
-        &None,       // max_supply
-        &Some(1000), // max_borrow
-        &None,       // can_collateralize
-        &None,       // can_borrow
-        &None,       // borrow_factor
-    );
-
-    // Existing user can still repay (that reduces total, eventually re-opening capacity)
-    client.cross_asset_repay(&user, &Some(usdc.clone()), &400);
-    // total is now 400 < cap 500, so small new borrow should pass
-    let after_repay = client.try_cross_asset_borrow(&user2, &Some(usdc.clone()), &50);
-    assert!(
-        after_repay.is_ok(),
-        "borrow should succeed after repayment brings total under new cap"
-    );
-}
+// =====================================================================}

@@ -21,6 +21,7 @@
 use soroban_sdk::{contract, contracterror, contractimpl, Address, Env, Symbol};
 
 /// Vesting schedule data structure
+#[soroban_sdk::contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VestingSchedule {
     /// Beneficiary address
@@ -92,7 +93,9 @@ impl VestingContract {
             return Err(VestingError::ScheduleExists);
         }
 
-        env.storage().persistent().set(&VestingDataKey::ADMIN, &admin);
+        env.storage()
+            .persistent()
+            .set(&VestingDataKey::ADMIN, &admin);
         Ok(())
     }
 
@@ -178,7 +181,7 @@ impl VestingContract {
         }
 
         let current_time = env.ledger().timestamp();
-        
+
         // Handle edge case: before start time
         if current_time < schedule.start_timestamp {
             return Ok((0, 0, false));
@@ -278,7 +281,11 @@ impl VestingContract {
     }
 
     /// Deactivate a schedule (admin only)
-    pub fn deactivate_schedule(env: Env, admin: Address, beneficiary: Address) -> Result<(), VestingError> {
+    pub fn deactivate_schedule(
+        env: Env,
+        admin: Address,
+        beneficiary: Address,
+    ) -> Result<(), VestingError> {
         let stored_admin: Address = env
             .storage()
             .persistent()

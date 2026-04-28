@@ -22,8 +22,8 @@ use crate::events::{
     emit_admin_action, emit_pause_state_changed, emit_risk_params_updated, AdminActionEvent,
     PauseStateChangedEvent, RiskParamsUpdatedEvent,
 };
-use soroban_sdk::{contracterror, contracttype, Address, Env, IntoVal, Map, Symbol, Val, Vec};
 use crate::prelude::*;
+use soroban_sdk::{contracterror, contracttype, Address, Env, IntoVal, Map, Symbol, Val, Vec};
 
 /// Errors that can occur during risk management operations
 #[contracterror]
@@ -56,6 +56,8 @@ pub enum RiskManagementError {
     GovernanceRequired = 12,
     /// Contract has already been initialized
     AlreadyInitialized = 13,
+    /// Protocol is in read-only mode
+    ReadOnlyMode = 14,
 }
 /// Storage keys for risk management data
 #[contracttype]
@@ -68,6 +70,9 @@ pub enum RiskDataKey {
     /// Global emergency pause flag. If true, all protocol operations are halted.
     /// Value type: bool
     EmergencyPause,
+    /// Read-only mode flag. If true, all state-changing operations are disabled.
+    /// Value type: bool
+    ReadOnlyMode,
     /// Timelock for safety of sensitive parameter changes
     /// Value type: u64 (timestamp)
     ParameterChangeTimelock,
@@ -125,7 +130,6 @@ pub fn initialize_risk_management(env: &Env, admin: Address) -> Result<(), RiskM
     // Admin is already set in the centralized admin module during contract initialize
     // We don't set it here anymore to maintain a single source of truth.
 
-
     // Initialize default risk config for pause switches
     let default_config = RiskConfig {
         pause_switches: create_default_pause_switches(env),
@@ -138,6 +142,10 @@ pub fn initialize_risk_management(env: &Env, admin: Address) -> Result<(), RiskM
     // Initialize emergency pause as false
     let emergency_key = RiskDataKey::EmergencyPause;
     env.storage().persistent().set(&emergency_key, &false);
+
+    // Initialize read-only mode as false
+    let read_only_key = RiskDataKey::ReadOnlyMode;
+    env.storage().persistent().set(&read_only_key, &false);
 
     emit_admin_action(
         env,
@@ -273,20 +281,21 @@ pub fn is_operation_paused(env: &Env, operation: Symbol) -> bool {
 
 /// Require that an operation is not paused.
 ///
-/// Checks the **emergency pause first**, then the per-operation switch.
-/// This layering ensures a single `set_emergency_pause(true)` call halts
-/// every operation without having to update every individual switch.
+/// Checks the **read-only mode first**, then **emergency pause**, then the per-operation switch.
+/// This layering ensures a single `set_read_only_mode(true)` call halts
+/// every state-changing operation without having to update every individual switch.
 ///
 /// ## Pause precedence matrix
 ///
-/// | emergency | per-op | result                        |
-/// |-----------|--------|-------------------------------|
-/// | false     | false  | ✅ allowed                     |
-/// | false     | true   | ❌ `OperationPaused`           |
-/// | true      | false  | ❌ `EmergencyPaused`           |
-/// | true      | true   | ❌ `EmergencyPaused` (wins)    |
+/// | read-only | emergency | per-op | result                        |
+/// |-----------|-----------|--------|-------------------------------|
+/// | true      | any       | any    | ❌ `ReadOnlyMode` (wins)       |
+/// | false     | true      | any    | ❌ `EmergencyPaused`           |
+/// | false     | false     | true   | ❌ `OperationPaused`           |
+/// | false     | false     | false  | ✅ allowed                     |
 ///
 /// # Errors
+/// * [`RiskManagementError::ReadOnlyMode`] – protocol is in read-only mode.
 /// * [`RiskManagementError::EmergencyPaused`] – global emergency halt is active.
 /// * [`RiskManagementError::OperationPaused`] – this specific operation is paused.
 ///
@@ -297,6 +306,10 @@ pub fn require_operation_not_paused(
     env: &Env,
     operation: Symbol,
 ) -> Result<(), RiskManagementError> {
+    // Read-only mode takes highest precedence as it disables all state changes.
+    if is_read_only_mode(env) {
+        return Err(RiskManagementError::ReadOnlyMode);
+    }
     // Emergency pause takes precedence over per-operation switches.
     if is_emergency_paused(env) {
         return Err(RiskManagementError::EmergencyPaused);
@@ -310,7 +323,11 @@ pub fn require_operation_not_paused(
 /// Check if operation is paused (public helper for other modules)
 /// This is a convenience function that can be called from other modules
 pub fn check_operation_paused(env: &Env, operation: Symbol) -> bool {
-    // First check emergency pause
+    // First check read-only mode
+    if is_read_only_mode(env) {
+        return true;
+    }
+    // Then check emergency pause
     if is_emergency_paused(env) {
         return true;
     }
@@ -364,6 +381,52 @@ pub fn check_emergency_pause(env: &Env) -> Result<(), RiskManagementError> {
     Ok(())
 }
 
+/// Set read-only mode (admin only)
+///
+/// Read-only mode disables all state-changing operations but allows view functions.
+///
+/// # Arguments
+/// * `env` - The Soroban environment
+/// * `caller` - The caller address (must be admin)
+/// * `enabled` - Whether to enable (true) or disable (false) read-only mode
+///
+/// # Returns
+/// Returns Ok(()) on success
+pub fn set_read_only_mode(
+    env: &Env,
+    caller: Address,
+    enabled: bool,
+) -> Result<(), RiskManagementError> {
+    // Check admin
+    require_admin(env, &caller)?;
+
+    // Set read-only mode
+    let read_only_key = RiskDataKey::ReadOnlyMode;
+    env.storage().persistent().set(&read_only_key, &enabled);
+
+    // Emit event
+    emit_read_only_mode_event(env, &caller, enabled);
+
+    Ok(())
+}
+
+/// Check if read-only mode is active
+pub fn is_read_only_mode(env: &Env) -> bool {
+    let read_only_key = RiskDataKey::ReadOnlyMode;
+    env.storage()
+        .persistent()
+        .get::<RiskDataKey, bool>(&read_only_key)
+        .unwrap_or(false)
+}
+
+/// Require that read-only mode is not active
+pub fn check_read_only_mode(env: &Env) -> Result<(), RiskManagementError> {
+    if is_read_only_mode(env) {
+        return Err(RiskManagementError::ReadOnlyMode);
+    }
+    Ok(())
+}
+
 /// Emit pause switch updated event
 fn emit_pause_switch_updated_event(env: &Env, caller: &Address, operation: &Symbol, paused: bool) {
     emit_pause_state_changed(
@@ -400,6 +463,19 @@ fn emit_emergency_pause_event(env: &Env, caller: &Address, paused: bool) {
             actor: caller.clone(),
             operation: Symbol::new(env, "emergency"),
             paused,
+            timestamp: env.ledger().timestamp(),
+        },
+    );
+}
+
+/// Emit read-only mode event
+fn emit_read_only_mode_event(env: &Env, caller: &Address, enabled: bool) {
+    emit_pause_state_changed(
+        env,
+        PauseStateChangedEvent {
+            actor: caller.clone(),
+            operation: Symbol::new(env, "read_only"),
+            paused: enabled,
             timestamp: env.ledger().timestamp(),
         },
     );

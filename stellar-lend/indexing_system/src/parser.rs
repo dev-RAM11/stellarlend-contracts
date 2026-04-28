@@ -101,6 +101,13 @@ impl EventParser {
             event_data.insert(param.name, value);
         }
 
+        // Extract schema_version from the decoded payload if present.
+        // Versioned StellarLend events carry a `schema_version: u32` field.
+        let schema_version = event_data
+            .get("schema_version")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+
         Ok(Some(CreateEvent {
             contract_address,
             event_name: event_def.name.clone(),
@@ -120,6 +127,7 @@ impl EventParser {
                 .ok_or_else(|| IndexerError::EventParsing("Missing log index".to_string()))?
                 .as_u32(),
             event_data: Value::Object(event_data),
+            schema_version,
         }))
     }
 

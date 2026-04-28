@@ -47,29 +47,6 @@ fn create_test_protocol_config(env: &Env) -> AmmProtocolConfig {
     }
 }
 
-// Mock AMM contract for testing
-#[contract]
-pub struct MockAmm;
-
-#[contractimpl]
-impl MockAmm {
-    pub fn swap(
-        _env: Env,
-        _executor: Address,
-        _token_in: Option<Address>,
-        _token_out: Option<Address>,
-        amount_in: i128,
-        _min_amount_out: i128,
-        _callback_data: AmmCallbackData,
-    ) -> i128 {
-        // Simulate 1% fee
-        amount_in
-            .checked_mul(9900)
-            .and_then(|v| v.checked_div(10000))
-            .unwrap_or(0)
-    }
-}
-
 #[test]
 fn test_initialize_amm_settings() {
     let env = Env::default();
@@ -80,8 +57,12 @@ fn test_initialize_amm_settings() {
 
     // Initialize AMM settings - this should not panic
     contract.initialize_amm_settings(
-        &admin, &100,   // 1% default slippage
+        &admin, 
+        &100,   // 1% default slippage
         &1000,  // 10% max slippage
+        &500,   // 5% max price divergence
+        &None,  // oracle address
+        &None,  // native asset address
         &10000, // 10000 auto-swap threshold
     );
 
@@ -106,7 +87,7 @@ fn test_add_amm_protocol() {
     let _protocol_addr = Address::generate(&env);
 
     // Initialize first
-    contract.initialize_amm_settings(&admin, &100, &1000, &10000);
+    contract.initialize_amm_settings(&admin, &100, &1000, &500, &None, &None, &10000);
 
     // Create protocol config (registers MockAmm)
     let protocol_config = create_test_protocol_config(&env);
@@ -131,18 +112,21 @@ fn test_update_amm_settings() {
     let admin = Address::generate(&env);
 
     // Initialize
-    contract.initialize_amm_settings(&admin, &100, &1000, &10000);
+    contract.initialize_amm_settings(&admin, &100, &1000, &500, &None, &None, &10000);
 
-    // Update settings
-    let new_settings = AmmSettings {
+    // Initialize
+    let settings = AmmSettings {
         default_slippage: 200,
         max_slippage: 2000,
+        max_price_divergence: 500,
+        oracle_address: None,
+        native_asset_address: None,
         swap_enabled: false,
         liquidity_enabled: true,
         auto_swap_threshold: 20000,
     };
 
-    contract.update_amm_settings(&admin, &new_settings);
+    contract.update_amm_settings(&admin, &settings);
 
     // Verify settings were updated
     let settings = contract.get_amm_settings().unwrap();
@@ -153,8 +137,93 @@ fn test_update_amm_settings() {
     assert_eq!(settings.auto_swap_threshold, 20000);
 }
 
+#[soroban_sdk::contract]
+pub struct MockOracle;
+
+#[soroban_sdk::contractimpl]
+impl MockOracle {
+    pub fn get_price(_env: Env, _asset: Address) -> i128 {
+        1000 // Fixed price for all assets in mock
+    }
+}
+
+#[soroban_sdk::contract]
+pub struct DivergentOracle;
+
+#[soroban_sdk::contractimpl]
+impl DivergentOracle {
+    pub fn get_price(_env: Env, _asset: Address) -> i128 {
+        2000 // Divergent price
+    }
+}
+
 #[test]
-fn test_successful_swap() {
+fn test_swap_failure_price_divergence() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract = create_amm_contract(&env);
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let oracle_addr = env.register(DivergentOracle, ());
+
+    // Initialize with 5% max divergence (500 bps)
+    contract.initialize_amm_settings(&admin, &100, &1000, &500, &Some(oracle_addr), &None, &10000);
+
+    let protocol_config = create_test_protocol_config(&env);
+    let protocol_addr = protocol_config.protocol_address.clone();
+    contract.add_amm_protocol(&admin, &protocol_config);
+
+    let token_b = protocol_config.supported_pairs.get(0).unwrap().token_b.unwrap();
+
+    // The MockAmm gives 9900 out for 10000 in (price ~0.99)
+    // The DivergentOracle says price is 2000 for both.
+    // oracle_price = 2000 / 2000 * 1e18 = 1.0e18.
+    // effective_price = 9900 / 10000 * 1e18 = 0.99e18.
+    // divergence = |1.0 - 0.99| / 1.0 = 1% = 100 bps.
+    // 100 bps < 500 bps (max divergence), so this should succeed.
+    
+    let params = SwapParams {
+        protocol: protocol_addr.clone(),
+        token_in: None,
+        token_out: Some(token_b.clone()),
+        amount_in: 10000,
+        min_amount_out: 1000,
+        slippage_tolerance: 100,
+        deadline: env.ledger().timestamp() + 3600,
+    };
+
+    let amount_out = contract.execute_swap(&user, &params);
+    assert_eq!(amount_out, 9900);
+
+    // Now update settings to 0.5% max divergence (50 bps)
+    let mut settings = contract.get_amm_settings().unwrap();
+    settings.max_price_divergence = 50;
+    contract.update_amm_settings(&admin, &settings);
+
+    // This should fail now as 100 bps > 50 bps
+    let result = contract.try_execute_swap(&user, &params);
+    assert!(result.is_err());
+}
+
+#[soroban_sdk::contract]
+pub struct MultiPriceOracle;
+
+#[soroban_sdk::contractimpl]
+impl MultiPriceOracle {
+    pub fn get_price(env: Env, asset: Address) -> i128 {
+        // Return different prices to simulate divergence
+        // We'll use a simple map stored in contract storage for testing
+        env.storage().instance().get::<Address, i128>(&asset).unwrap_or(1000)
+    }
+
+    pub fn set_price(env: Env, asset: Address, price: i128) {
+        env.storage().instance().set(&asset, &price);
+    }
+}
+
+#[test]
+fn test_swap_failure_large_price_divergence_sandwich() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -162,8 +231,145 @@ fn test_successful_swap() {
     let admin = Address::generate(&env);
     let user = Address::generate(&env);
     
-    contract.initialize_amm_settings(&admin, &100, &1000, &10000);
+    let oracle_addr = env.register(MultiPriceOracle, ());
+    let oracle_client = MultiPriceOracleClient::new(&env, &oracle_addr);
+
+    let protocol_config = create_test_protocol_config(&env);
+    let protocol_addr = protocol_config.protocol_address.clone();
+    let token_b = protocol_config.supported_pairs.get(0).unwrap().token_b.unwrap();
+    let native_addr = Address::generate(&env); // Mock native address
+
+    // Set oracle prices: 1 XLM = 1000 USDC
+    oracle_client.set_price(&native_addr, &1000);
+    oracle_client.set_price(&token_b, &1);
+
+    // Initialize with 2% max divergence (200 bps)
+    contract.initialize_amm_settings(&admin, &100, &1000, &200, &Some(oracle_addr), &Some(native_addr), &10000);
+    contract.add_amm_protocol(&admin, &protocol_config);
+
+    // Scenario: AMM price is manipulated (sandwich attack)
+    // Oracle price ratio = 1000 / 1 = 1000.
+    // Effective price should be around 1000.
     
+    // 1. Normal swap: 10 XLM -> 10000 USDC (minus fee)
+    // Actually, MockAmm returns 10 * 0.99 = 9.9 USDC.
+    // Oracle price ratio is 1000. This is a huge divergence (99% divergence).
+    let params = SwapParams {
+        protocol: protocol_addr.clone(),
+        token_in: None,
+        token_out: Some(token_b.clone()),
+        amount_in: 10,
+        min_amount_out: 1,
+        slippage_tolerance: 100,
+        deadline: env.ledger().timestamp() + 3600,
+    };
+    
+    // This should fail because effective price (0.99) is far from oracle price (1000)
+    let result = contract.try_execute_swap(&user, &params);
+    assert!(result.is_err());
+    // AmmError::PriceDivergenceExceeded = 15
+    // Result<T, E> where E is converted to u32 for contract error
+    // In Soroban tests, we can check the error code
+}
+
+#[test]
+fn test_auto_swap_for_collateral_failure_price_divergence() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract = create_amm_contract(&env);
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    
+    let oracle_addr = env.register(MultiPriceOracle, ());
+    let oracle_client = MultiPriceOracleClient::new(&env, &oracle_addr);
+
+    let protocol_config = create_test_protocol_config(&env);
+    let token_b = protocol_config.supported_pairs.get(0).unwrap().token_b.unwrap();
+    let native_addr = Address::generate(&env);
+
+    // Set oracle prices: 1 XLM = 2 USDC (2:1 ratio)
+    // MockAmm returns 0.99 USDC for 1 XLM (approx 1:1 ratio)
+    // Divergence is approx 50%
+    oracle_client.set_price(&native_addr, &2);
+    oracle_client.set_price(&token_b, &1);
+
+    // Initialize with 1% max divergence (100 bps)
+    contract.initialize_amm_settings(&admin, &100, &1000, &100, &Some(oracle_addr), &Some(native_addr), &100);
+    contract.add_amm_protocol(&admin, &protocol_config);
+
+    // This should fail because divergence (50%) > max divergence (1%)
+    let result = contract.try_auto_swap_for_collateral(&user, &Some(token_b), &1000);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_swap_adversarial_sandwich_with_price_divergence() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract = create_amm_contract(&env);
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    
+    let oracle_addr = env.register(MultiPriceOracle, ());
+    let oracle_client = MultiPriceOracleClient::new(&env, &oracle_addr);
+
+    let protocol_config = create_test_protocol_config(&env);
+    let protocol_addr = protocol_config.protocol_address.clone();
+    let token_b = protocol_config.supported_pairs.get(0).unwrap().token_b.unwrap();
+    let native_addr = Address::generate(&env);
+
+    // Set oracle prices: 1 XLM = 10 USDC (10:1 ratio)
+    oracle_client.set_price(&native_addr, &10 * 1_000_000_000_000_000_000); // 10e18
+    oracle_client.set_price(&token_b, &1 * 1_000_000_000_000_000_000); // 1e18
+
+    // Initialize with 2% max divergence (200 bps)
+    contract.initialize_amm_settings(&admin, &100, &1000, &200, &Some(oracle_addr), &Some(native_addr), &10000);
+    contract.add_amm_protocol(&admin, &protocol_config);
+
+    // Scenario: Attacker has moved the AMM price to 1 XLM = 5 USDC (5:1 ratio)
+    // The user wants to swap 1 XLM for USDC.
+    // The user's slippage tolerance is high (e.g. 50%), so they might accept 5 USDC.
+    // However, the oracle says it should be 10 USDC. 
+    // The divergence is |10 - 5| / 10 = 50% = 5000 bps.
+    // This exceeds the 200 bps limit.
+
+    // MockAmm returns amount_in * 0.99.
+    // To simulate a 5:1 ratio in MockAmm, we can adjust the amount_in/out expectations.
+    // Actually, our MockAmm is simple. Let's make a more flexible MockAmm if needed, 
+    // but for now, we can just check if the validation fails when the ratio is wrong.
+    
+    let params = SwapParams {
+        protocol: protocol_addr.clone(),
+        token_in: None,
+        token_out: Some(token_b.clone()),
+        amount_in: 1_000_000_000_000_000_000, // 1 XLM
+        min_amount_out: 4_000_000_000_000_000_000, // User expects at least 4 USDC (high slippage)
+        slippage_tolerance: 5000, // 50%
+        deadline: env.ledger().timestamp() + 3600,
+    };
+
+    // The MockAmm will return 1e18 * 0.99 = 0.99e18 USDC.
+    // Effective price = 0.99e18 / 1e18 * 1e18 = 0.99e18.
+    // Oracle price = 10e18.
+    // Divergence is huge.
+    
+    let result = contract.try_execute_swap(&user, &params);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_execute_swap() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract = create_amm_contract(&env);
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    contract.initialize_amm_settings(&admin, &100, &1000, &500, &None, &None, &10000);
+
     let protocol_addr = env.register(MockAmm, ());
     let token_b = Address::generate(&env);
     let mut supported_pairs = Vec::new(&env);
@@ -172,7 +378,7 @@ fn test_successful_swap() {
         token_b: Some(token_b.clone()),
         pool_address: Address::generate(&env),
     });
-    
+
     let protocol_config = AmmProtocolConfig {
         protocol_address: protocol_addr.clone(),
         protocol_name: Symbol::new(&env, "TestAMM"),
@@ -215,7 +421,7 @@ fn test_swap_failure_insufficient_output() {
     let admin = Address::generate(&env);
     let user = Address::generate(&env);
 
-    contract.initialize_amm_settings(&admin, &100, &1000, &10000);
+    contract.initialize_amm_settings(&admin, &100, &1000, &500, &None, &None, &10000);
     let protocol_config = create_test_protocol_config(&env);
     let protocol_addr = protocol_config.protocol_address.clone();
     contract.add_amm_protocol(&admin, &protocol_config);
@@ -246,7 +452,7 @@ fn test_swap_failure_deadline_exceeded() {
     let admin = Address::generate(&env);
     let user = Address::generate(&env);
 
-    contract.initialize_amm_settings(&admin, &100, &1000, &10000);
+    contract.initialize_amm_settings(&admin, &100, &1000, &500, &None, &None, &10000);
     let protocol_config = create_test_protocol_config(&env);
     let protocol_addr = protocol_config.protocol_address.clone();
     contract.add_amm_protocol(&admin, &protocol_config);
@@ -275,7 +481,7 @@ fn test_swap_failure_paused() {
     let user = Address::generate(&env);
     let _protocol_addr = Address::generate(&env);
 
-    contract.initialize_amm_settings(&admin, &100, &1000, &10000);
+    contract.initialize_amm_settings(&admin, &100, &1000, &500, &None, &None, &10000);
     let mut settings = contract.get_amm_settings().unwrap();
     settings.swap_enabled = false;
     contract.update_amm_settings(&admin, &settings);

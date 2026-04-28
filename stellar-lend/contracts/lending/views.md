@@ -110,6 +110,74 @@ All fields match the corresponding individual getters.
 
 ---
 
+## View Guarantees (cross-asset position summary invariants)
+
+The view layer is a load-bearing surface for liquidation bots, frontends, and
+downstream contracts. The following guarantees are pinned by the invariant
+suite in `stellar-lend/contracts/lending/src/views_test.rs` and must never be
+weakened without an explicit, audited change.
+
+### G1. Summary–getter consistency
+
+`get_user_position(user)` must return field-for-field exactly what the
+individual getters return for the same `user` at the same ledger height:
+
+- `summary.collateral_balance == get_collateral_balance(user)`
+- `summary.debt_balance == get_debt_balance(user)`
+- `summary.collateral_value == get_collateral_value(user)`
+- `summary.debt_value == get_debt_value(user)`
+- `summary.health_factor == get_health_factor(user)`
+
+### G2. Stable serialization (idempotence)
+
+The view output is a pure function of `(storage, oracle, ledger height)`.
+Repeated calls in any order must yield bit-identical results — no view path
+may mutate state, cache stale derived values, or depend on call order.
+
+### G3. Threshold isolation
+
+Changing `liquidation_threshold_bps` may move `health_factor` but must not
+move any of `collateral_balance`, `collateral_value`, `debt_balance`, or
+`debt_value`. Those four are functions of raw state and oracle output only.
+
+### G4. Missing-asset and missing-oracle behaviour
+
+- A user with no recorded position returns a default summary: zero balances,
+  zero values, and `health_factor == HEALTH_FACTOR_NO_DEBT`.
+- When the oracle is unconfigured, every value-bearing field reads as `0`
+  consistently. Raw balance fields remain exact and non-zero. The contract
+  refuses to emit a non-zero `health_factor` without price data so liquidators
+  cannot act on stale assumptions.
+
+### G5. Rounding semantics
+
+Health-factor division truncates toward zero. The boundary case
+`health_factor == HEALTH_FACTOR_SCALE` (exactly 1.0) is treated as healthy:
+`get_max_liquidatable_amount` returns `0` here. Any refactor that switches to
+ceiling rounding or float math will break the invariant suite.
+
+### G6. Liquidation-incentive monotonicity
+
+`get_liquidation_incentive_amount(repay)` is monotonic non-decreasing in
+`repay`. Negative or zero `repay` always yields `0`. This forbids a future
+incentive curve that liquidators could game by splitting repayments.
+
+### G7. Independence across users
+
+Each user's summary depends only on that user's positions and the global
+risk parameters. There is no cross-user contamination — pinned by the
+"independent users" invariant test.
+
+### Security: no view-based exploitation assumptions
+
+- Views never mutate state, never charge fees, and never trigger external
+  contract calls beyond the read-only oracle lookup. Callers may safely
+  invoke them off-chain.
+- Integrators MUST NOT rely on a view's value beyond the ledger height at
+  which it was observed. Oracle prices and risk parameters can change.
+
+---
+
 ## Example Commit Message
 
 ```

@@ -101,17 +101,17 @@ fn test_governance_asset_config_update() {
     );
 
     // Vote
-    env.ledger().set_timestamp(env.ledger().timestamp() + 1);
+    env.ledger().with_mut(|li| li.timestamp += 1);
     client.gov_vote(&voter, &proposal_id, &VoteType::For);
 
     // Pass voting period
-    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    env.ledger().with_mut(|li| li.timestamp += 3601);
 
     // Queue
     client.gov_queue_proposal(&voter, &proposal_id);
 
     // Wait for execution delay
-    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    env.ledger().with_mut(|li| li.timestamp += 3601);
 
     // Execute
     client.gov_execute_proposal(&voter, &proposal_id);
@@ -153,11 +153,11 @@ fn test_governance_pause_unpause() {
     );
 
     // Vote, Pass, Queue, Execute
-    env.ledger().set_timestamp(env.ledger().timestamp() + 1);
+    env.ledger().with_mut(|li| li.timestamp += 1);
     client.gov_vote(&voter, &proposal_id, &VoteType::For);
-    env.ledger().set_timestamp(env.ledger().timestamp() + 7202); // Pass voting + delay
+    env.ledger().with_mut(|li| li.timestamp += 7202); // Pass voting + delay
     client.gov_queue_proposal(&voter, &proposal_id);
-    env.ledger().set_timestamp(env.ledger().timestamp() + 3601);
+    env.ledger().with_mut(|li| li.timestamp += 3601);
     client.gov_execute_proposal(&voter, &proposal_id);
 
     // Verify paused

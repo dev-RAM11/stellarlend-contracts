@@ -16,6 +16,7 @@ off-chain relayer that reads the events emitted by this contract.
 - [Public API](#public-api)
 - [Fee Calculation](#fee-calculation)
 - [Network ID and Replay Protection](#network-id-and-replay-protection)
+- [Canonical Withdrawal Message IDs](#canonical-withdrawal-message-ids)
 - [Security Notes](#security-notes)
 - [Error Reference](#error-reference)
 - [Running Tests](#running-tests)
@@ -104,11 +105,12 @@ Any authenticated caller. Records an inbound deposit and returns the net amount
 after fee deduction. The off-chain relayer uses the net amount to credit the
 recipient on the destination chain.
 
-### `bridge_withdraw(caller, bridge_id, recipient, amount) → Result<(), ContractError>`
+### `bridge_withdraw(caller, bridge_id, message_id, recipient, amount) → Result<(), ContractError>`
 
 Admin or relayer. Records an outbound withdrawal and emits a
 `BridgeWithdrawalEvent` that the off-chain relayer uses to execute the actual
 token transfer on the destination chain. Allowed even when the bridge is inactive.
+Each withdrawal must provide a unique 32-byte `message_id`; reusing one is rejected.
 
 ### `set_relayer(caller, relayer) → Result<(), ContractError>`
 
@@ -155,8 +157,37 @@ Off-chain relayers **must** verify that the `network_id` in the event matches th
 intended destination chain before executing any token transfer. This prevents a
 withdrawal message intended for chain A from being replayed on chain B.
 
-Transaction-level uniqueness on Stellar is provided by the ledger's sequence
-number mechanism. This contract does not maintain a per-operation nonce.
+For withdrawals, the contract also stores every processed `message_id` under
+`DataKey::ProcessedWithdrawal`. A second call with the same `message_id` fails
+with `ContractError::MessageAlreadyProcessed`, which prevents duplicate
+recording of the same bridge instruction even if the caller retries with the
+same payload.
+
+## Canonical Withdrawal Message IDs
+
+`message_id` is treated on-chain as an opaque `BytesN<32>`, but operators should
+derive it from immutable source-chain facts so uniqueness does not rely on
+human coordination. A recommended format is:
+
+```text
+message_id = hash(
+  source_chain_id ||
+  source_tx_hash ||
+  source_log_index ||
+  bridge_id ||
+  recipient ||
+  amount
+)
+```
+
+The exact hash function may follow the remote bridge stack, but the encoding
+must be canonical and deterministic across all relayers. Two relayers observing
+the same remote withdrawal intent should compute the same `message_id`.
+
+Trust assumption: this contract enforces one-time use of a `message_id`, but it
+cannot prove that a relayer chose the *correct* ID. Off-chain infrastructure
+must therefore reject any withdrawal request whose `message_id` is not derived
+from the canonical source event.
 
 ---
 
@@ -183,6 +214,16 @@ This contract does **not** hold or transfer tokens. It is a bookkeeping layer
 only. Operators are responsible for ensuring that the off-chain bridge protocol
 correctly matches on-chain event data before moving funds.
 
+### Relayer trust model
+- `bridge_deposit` remains user-authorized and is unique at the Stellar
+  transaction level; relayers should still reconcile deposits against their
+  escrow or lockbox flow before crediting another chain.
+- `bridge_withdraw` is replay-resistant on-chain only when relayers submit the
+  canonical `message_id` for the source withdrawal event.
+- A malicious or buggy relayer cannot reuse an already-processed `message_id`,
+  but could still create inconsistent requests if operators do not validate the
+  source-chain event that produced the ID.
+
 ### Bridge ID validation
 Bridge IDs are validated for length (1–64 bytes) and character set
 (`[a-zA-Z0-9_-]`) before any storage write. This prevents storage-key injection
@@ -207,6 +248,7 @@ and ensures deterministic key serialisation.
 | 11 | `AmountNotPositive` | Amount ≤ 0 |
 | 12 | `AmountBelowMinimum` | Amount < bridge `min_amount` |
 | 13 | `Overflow` | Accounting integer overflow |
+| 14 | `MessageAlreadyProcessed` | Withdrawal `message_id` was already used |
 
 ---
 
@@ -220,4 +262,5 @@ cargo test -p bridge
 stellar contract build --package bridge
 ```
 
-Expected output: **65 tests, 0 failures**.
+Expected output: bridge unit tests complete with replay-resistance, fee-rounding,
+authorization, and arithmetic coverage and no failures.

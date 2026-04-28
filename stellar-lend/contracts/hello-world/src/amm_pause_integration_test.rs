@@ -25,18 +25,15 @@
 //!   rejected even after un-pausing.
 
 use super::*;
+use crate::amm::{
+    AmmContract, AmmContractClient, AmmProtocolConfig, MockAmm, SwapParams, TokenPair,
+};
 use crate::amm::{AmmProtocolConfig, AmmSettings, LiquidityParams, SwapParams, TokenPair};
 use soroban_sdk::{testutils::Address as _, testutils::Ledger, Address, Env, Symbol, Vec};
-use crate::amm::{AmmProtocolConfig, MockAmm, SwapParams, TokenPair, AmmContract, AmmContractClient};
 
 // ─────────────────────────────────────────────
 // Shared test helpers
 // ─────────────────────────────────────────────
-
-#[soroban_sdk::contract]
-pub struct MockAmm;
-#[soroban_sdk::contractimpl]
-impl MockAmm {}
 
 /// Creates an [`AmmContract`] client registered against a fresh environment.
 fn setup_contract(env: &Env) -> AmmContractClient {
@@ -585,7 +582,7 @@ fn test_pause_callback_validation_independent_of_swap_pause() {
     contract.add_amm_protocol(&admin, &cfg);
 
     // Perform one swap while unpaused to advance the user's nonce to 2.
-    env.ledger().set_timestamp(1_000);
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
     let params = SwapParams {
         protocol: protocol_addr.clone(),
         token_in: None,
@@ -740,7 +737,7 @@ fn test_pause_unauthorized_swap_fails_when_paused() {
 fn test_pause_expired_deadline_swap_fails_when_paused() {
     let env = Env::default();
     env.mock_all_auths();
-    env.ledger().set_timestamp(5_000);
+    env.ledger().with_mut(|li| li.timestamp = 5_000);
 
     let (contract, admin, user) = setup_initialized(&env);
     let token_b = Address::generate(&env);

@@ -49,8 +49,8 @@
 //! - Checked arithmetic is used throughout — no unchecked ops.
 //! - `SECONDS_PER_YEAR = 365 × 86_400 = 31_536_000` (no leap seconds).
 
-use soroban_sdk::{contracterror, contracttype, Address, Env};
 use crate::prelude::*;
+use soroban_sdk::{contracterror, contracttype, Address, Env};
 
 use crate::deposit::{DepositDataKey, ProtocolAnalytics};
 
@@ -161,6 +161,9 @@ const SECONDS_PER_YEAR: u64 = 365 * 86_400;
 /// Maximum allowed value for slope parameters (`multiplier_bps`, `jump_multiplier_bps`).
 /// Set to 100 000 bps (1000%) to allow aggressive-but-bounded curves.
 const MAX_SLOPE_BPS: i128 = 100_000;
+
+/// Maximum allowed rate change in a single parameter update (5%).
+const MAX_RATE_CHANGE_BPS: i128 = 500;
 
 // =============================================================================
 // Default Configuration
@@ -295,8 +298,10 @@ pub fn calculate_utilization(env: &Env) -> Result<i128, InterestRateError> {
 /// # Security
 /// - All arithmetic uses checked operations.
 /// - Rate is always clamped to `[rate_floor_bps, rate_ceiling_bps]`.
-pub fn calculate_borrow_rate(env: &Env) -> Result<i128, InterestRateError> {
-    let config = get_interest_rate_config(env).ok_or(InterestRateError::InvalidParameter)?;
+pub fn calculate_borrow_rate_internal(
+    env: &Env,
+    config: &InterestRateConfig,
+) -> Result<i128, InterestRateError> {
     let utilization = calculate_utilization(env)?;
 
     let mut rate = config.base_rate_bps;
@@ -352,6 +357,11 @@ pub fn calculate_borrow_rate(env: &Env) -> Result<i128, InterestRateError> {
     rate = rate.max(config.rate_floor_bps).min(config.rate_ceiling_bps);
 
     Ok(rate)
+}
+
+pub fn calculate_borrow_rate(env: &Env) -> Result<i128, InterestRateError> {
+    let config = get_interest_rate_config(env).ok_or(InterestRateError::InvalidParameter)?;
+    calculate_borrow_rate_internal(env, &config)
 }
 
 // =============================================================================
@@ -642,8 +652,32 @@ pub fn update_interest_rate_config(
         config.spread_bps = spread;
     }
 
+    // Rate Change Limit Check
+    let old_config = get_interest_rate_config(env).ok_or(InterestRateError::InvalidParameter)?;
+    let old_rate = calculate_borrow_rate_internal(env, &old_config)?;
+    let new_rate = calculate_borrow_rate_internal(env, &config)?;
+
+    if (new_rate - old_rate).abs() > MAX_RATE_CHANGE_BPS {
+        return Err(InterestRateError::ParameterChangeTooLarge);
+    }
+
     config.last_update = env.ledger().timestamp();
     env.storage().persistent().set(&config_key, &config);
+
+    crate::events::emit_interest_rate_config_updated(
+        env,
+        crate::events::InterestRateConfigUpdatedEvent {
+            actor: caller,
+            base_rate_bps: config.base_rate_bps,
+            kink_utilization_bps: config.kink_utilization_bps,
+            multiplier_bps: config.multiplier_bps,
+            jump_multiplier_bps: config.jump_multiplier_bps,
+            rate_floor_bps: config.rate_floor_bps,
+            rate_ceiling_bps: config.rate_ceiling_bps,
+            spread_bps: config.spread_bps,
+            timestamp: config.last_update,
+        },
+    );
 
     Ok(())
 }
@@ -685,10 +719,25 @@ pub fn set_emergency_rate_adjustment(
     let config_key = InterestRateDataKey::InterestRateConfig;
     let mut config = get_interest_rate_config(env).ok_or(InterestRateError::InvalidParameter)?;
 
+    let old_adjustment = config.emergency_adjustment_bps;
+    if (adjustment_bps - old_adjustment).abs() > MAX_RATE_CHANGE_BPS {
+        return Err(InterestRateError::ParameterChangeTooLarge);
+    }
+
     config.emergency_adjustment_bps = adjustment_bps;
     config.last_update = env.ledger().timestamp();
 
     env.storage().persistent().set(&config_key, &config);
+
+    crate::events::emit_emergency_rate_adjustment(
+        env,
+        crate::events::EmergencyRateAdjustmentEvent {
+            actor: caller,
+            old_adjustment_bps: old_adjustment,
+            new_adjustment_bps: adjustment_bps,
+            timestamp: config.last_update,
+        },
+    );
 
     Ok(())
 }

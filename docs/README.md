@@ -4,12 +4,15 @@ This repository contains the Soroban smart contracts and related resources for t
 
 Contents:
 - Overview
+- [Developer Glossary](glossary.md)
 - Modules and Features
 - Admin Operations
 - Monitoring & Analytics
 - Upgrade & Configuration
 - Cross-Chain Bridge
 - Social Recovery & Multisig
+- Documentation
+
 
 ## Overview
 StellarLend is a lending and borrowing protocol built on Soroban. It features cross-asset accounting, risk management, governance, AMM integration, flash loans, and more.
@@ -17,6 +20,7 @@ StellarLend is a lending and borrowing protocol built on Soroban. It features cr
 ## Test Documentation
 
 - **[Borrow Function Tests](BORROW_TESTS.md)** - Comprehensive test suite documentation for the borrow functionality, covering all validation paths, edge cases, interest accrual, pause functionality, events, and security scenarios.
+- **[Incident Response](INCIDENT_RESPONSE.md)** - Documentation of pause mechanisms, read-only mode, precedence matrix, and guidance for administrators during security incidents.
 - **[Upgrade Authorization](UPGRADE_AUTHORIZATION.md)** - Authorization boundaries for upgrade operations, key rotation procedure, and covered failure scenarios.
 
 ## Modules and Features
@@ -83,7 +87,12 @@ Key admin entrypoints (see contract for full list):
 
 ## Cross-Chain Bridge
 - Register networks and fees, and use `bridge_deposit/bridge_withdraw` to move balances with transparent fees
+- `bridge_withdraw` is replay-resistant via a required unique `message_id`; relayers must derive it from canonical source-chain event data and verify the emitted `network_id` before moving funds
 
 ## Social Recovery & Multisig
 - Set guardians per-user and execute timelocked recoveries
 - Multisig supports proposing and executing admin changes with threshold
+
+## Documentation
+See the [Documentation Index](docs/INDEX.md) for a complete overview of project documentation.
+

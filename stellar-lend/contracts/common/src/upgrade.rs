@@ -382,8 +382,12 @@ impl UpgradeManager {
             panic_with_error!(&env, UpgradeError::InvalidStatus);
         }
 
-        let current_hash = Self::current_wasm_hash(env.clone());
         let current_version = Self::current_version(env.clone());
+        if proposal.new_version <= current_version {
+            panic_with_error!(&env, UpgradeError::InvalidVersion);
+        }
+
+        let current_hash = Self::current_wasm_hash(env.clone());
         proposal.prev_wasm_hash = Some(current_hash.clone());
         proposal.prev_version = Some(current_version);
         proposal.stage = UpgradeStage::Executed;
@@ -742,7 +746,7 @@ mod tests {
                 UpgradeManager::init(env.clone(), admin.clone(), wasm_hash.clone(), 1);
                 env.storage()
                     .persistent()
-                    .set(&UpgradeKey::NextProposalId, &u64::MAX);
+                    .set(&UpgradeKey::UpNextPropId, &u64::MAX);
                 UpgradeManager::upgrade_propose(env.clone(), admin.clone(), wasm_hash.clone(), 1);
             });
         }));

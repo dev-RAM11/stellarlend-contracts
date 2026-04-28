@@ -56,14 +56,22 @@ impl TokenVesting {
     /// Proposes a new admin for the contract.
     pub fn propose_admin(env: Env, new_admin: Address) {
         Self::require_admin(&env);
-        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
     }
 
     /// Accepts the admin role. Must be called by the pending admin.
     pub fn accept_admin(env: Env) {
-        let pending_admin: Address = env.storage().instance().get(&DataKey::PendingAdmin).unwrap_or_else(|| panic!("no pending admin"));
+        let pending_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or_else(|| panic!("no pending admin"));
         pending_admin.require_auth();
-        env.storage().instance().set(&DataKey::Admin, &pending_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::Admin, &pending_admin);
         env.storage().instance().remove(&DataKey::PendingAdmin);
     }
 
@@ -79,12 +87,16 @@ impl TokenVesting {
     ) {
         Self::require_admin(&env);
         Self::require_not_paused(&env);
-        if total_amount <= 0 { panic!("amount must be positive"); }
-        if start_time >= end_time { panic!("start must be before end"); }
+        if total_amount <= 0 {
+            panic!("amount must be positive");
+        }
+        if start_time >= end_time {
+            panic!("start must be before end");
+        }
         if cliff_time < start_time || cliff_time > end_time {
             panic!("cliff must be within start and end");
         }
-        
+
         // Ensure no previous schedule exists for this beneficiary
         let key = DataKey::Schedule(beneficiary.clone());
         if env.storage().persistent().has(&key) {
@@ -120,12 +132,20 @@ impl TokenVesting {
         beneficiary.require_auth();
 
         let key = DataKey::Schedule(beneficiary.clone());
-        let mut schedule: VestingSchedule = env.storage().persistent().get(&key).unwrap_or_else(|| panic!("no schedule"));
-        
-        if schedule.revoked { panic!("schedule revoked"); }
+        let mut schedule: VestingSchedule = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic!("no schedule"));
+
+        if schedule.revoked {
+            panic!("schedule revoked");
+        }
 
         let now = env.ledger().timestamp();
-        if now < schedule.cliff_time { panic!("cliff not reached"); }
+        if now < schedule.cliff_time {
+            panic!("cliff not reached");
+        }
 
         let vested = if now >= schedule.end_time {
             schedule.total_amount
@@ -137,7 +157,9 @@ impl TokenVesting {
         };
 
         let claimable = vested - schedule.amount_claimed;
-        if claimable <= 0 { panic!("nothing to claim"); }
+        if claimable <= 0 {
+            panic!("nothing to claim");
+        }
 
         schedule.amount_claimed += claimable;
         env.storage().persistent().set(&key, &schedule);
@@ -151,15 +173,23 @@ impl TokenVesting {
     /// Unvested tokens are returned to the admin.
     pub fn revoke(env: Env, beneficiary: Address) {
         Self::require_admin(&env);
-        
-        let key = DataKey::Schedule(beneficiary.clone());
-        let mut schedule: VestingSchedule = env.storage().persistent().get(&key).unwrap_or_else(|| panic!("no schedule"));
 
-        if !schedule.revocable { panic!("not revocable"); }
-        if schedule.revoked { panic!("already revoked"); }
+        let key = DataKey::Schedule(beneficiary.clone());
+        let mut schedule: VestingSchedule = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic!("no schedule"));
+
+        if !schedule.revocable {
+            panic!("not revocable");
+        }
+        if schedule.revoked {
+            panic!("already revoked");
+        }
 
         schedule.revoked = true;
-        
+
         let now = env.ledger().timestamp();
         let vested = if now >= schedule.end_time || now < schedule.cliff_time {
             // if before cliff, vested is 0. If after end, vested is total. But here we just say if now < cliff, 0. If now >= end, total.
@@ -176,8 +206,8 @@ impl TokenVesting {
 
         // Total remaining in contract for this beneficiary that hasn't been claimed yet
         let total_locked_for_user = schedule.total_amount - schedule.amount_claimed;
-        
-        // They keep what has vested but wasn't claimed, which they can still claim later? 
+
+        // They keep what has vested but wasn't claimed, which they can still claim later?
         // No, we will give what they haven't claimed of vested immediately to beneficiary,
         // and send unvested back to admin. Or we can just transfer everything unvested back.
         let claimable_now = vested - schedule.amount_claimed;
@@ -190,7 +220,11 @@ impl TokenVesting {
         let client = TokenClient::new(&env, &token_addr);
 
         if claimable_now > 0 {
-            client.transfer(&env.current_contract_address(), &beneficiary, &claimable_now);
+            client.transfer(
+                &env.current_contract_address(),
+                &beneficiary,
+                &claimable_now,
+            );
         }
 
         if unvested > 0 {
@@ -200,12 +234,20 @@ impl TokenVesting {
     }
 
     fn require_admin(env: &Env) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap_or_else(|| panic!("no admin"));
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("no admin"));
         admin.require_auth();
     }
 
     fn require_not_paused(env: &Env) {
-        let paused: bool = env.storage().instance().get(&DataKey::Paused).unwrap_or(false);
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
         if paused {
             panic!("paused");
         }

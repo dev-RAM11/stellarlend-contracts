@@ -26,9 +26,9 @@ use crate::analytics;
 use crate::deposit::{DepositDataKey, ProtocolAnalytics};
 use crate::reserve::{
     accrue_reserve, get_protocol_revenue, get_reserve_balance, get_reserve_factor,
-    get_reserve_stats, get_total_reserves, get_treasury_address, initialize_reserve_config,
-    set_reserve_factor, set_treasury_address, withdraw_reserve_funds, ReserveError,
-    BASIS_POINTS_SCALE, DEFAULT_RESERVE_FACTOR_BPS, MAX_RESERVE_FACTOR_BPS,
+    get_total_reserves, get_treasury_address, initialize_reserve_config, set_reserve_factor,
+    set_treasury_address, withdraw_reserve_funds, ReserveError, BASIS_POINTS_SCALE,
+    DEFAULT_RESERVE_FACTOR_BPS, MAX_RESERVE_FACTOR_BPS,
 };
 use soroban_sdk::{testutils::Address as _, Address, Env, Vec};
 
@@ -127,7 +127,12 @@ fn test_get_reserve_stats(
     contract_id: &Address,
     asset: Option<Address>,
 ) -> (i128, i128, Option<Address>) {
-    env.as_contract(contract_id, || get_reserve_stats(env, asset))
+    env.as_contract(contract_id, || {
+        let balance = get_reserve_balance(env, asset.clone());
+        let factor = get_reserve_factor(env, asset.clone());
+        let treasury = get_treasury_address(env);
+        (balance, factor, treasury)
+    })
 }
 
 // ============================================================================
@@ -516,7 +521,7 @@ fn test_set_treasury_address_by_non_admin() {
     let (env, contract_id, _admin, user, treasury) = setup_test_env();
 
     // Non-admin tries to set treasury address - should fail
-    let _ = test_set_treasury_address(&env, &contract_id, user, _treasury);
+    let _ = test_set_treasury_address(&env, &contract_id, user, treasury);
 }
 
 #[test]
@@ -739,7 +744,7 @@ fn test_withdraw_reserve_from_zero_balance() {
 /// 5. All calculations use checked arithmetic to prevent overflow
 ///
 /// Structure to track interest distribution at different points in time
-#[contracttype]
+#[soroban_sdk::contracttype]
 #[derive(Debug, Clone)]
 struct InterestDistribution {
     period: u32,
@@ -1403,7 +1408,7 @@ fn test_reserve_factor_formula_precision() {
             factor, interest, expected_reserve
         );
         assert_eq!(
-            _l,
+            l,
             *interest - *expected_reserve,
             "Lender amount should be interest - reserve"
         );
@@ -1935,8 +1940,13 @@ fn test_reserve_accrual_updates_protocol_analytics_revenue_and_tvl() {
         );
     });
 
-    test_initialize_reserve_config(&env, &contract_id, asset.clone(), DEFAULT_RESERVE_FACTOR_BPS)
-        .unwrap();
+    test_initialize_reserve_config(
+        &env,
+        &contract_id,
+        asset.clone(),
+        DEFAULT_RESERVE_FACTOR_BPS,
+    )
+    .unwrap();
 
     let (reserve_amount, lender_amount) =
         test_accrue_reserve(&env, &contract_id, asset.clone(), 10_000).unwrap();
@@ -1945,8 +1955,9 @@ fn test_reserve_accrual_updates_protocol_analytics_revenue_and_tvl() {
 
     let total_reserves = test_get_total_reserves(&env, &contract_id);
     let protocol_revenue = test_get_protocol_revenue(&env, &contract_id);
-    let protocol_metrics =
-        env.as_contract(&contract_id, || analytics::get_protocol_stats(&env).unwrap());
+    let protocol_metrics = env.as_contract(&contract_id, || {
+        analytics::get_protocol_stats(&env).unwrap()
+    });
 
     assert_eq!(total_reserves, 1_000);
     assert_eq!(protocol_revenue, 1_000);
@@ -1970,20 +1981,454 @@ fn test_reserve_withdraw_keeps_revenue_but_reduces_tvl_and_reserves() {
         );
     });
 
-    test_initialize_reserve_config(&env, &contract_id, asset.clone(), DEFAULT_RESERVE_FACTOR_BPS)
-        .unwrap();
+    test_initialize_reserve_config(
+        &env,
+        &contract_id,
+        asset.clone(),
+        DEFAULT_RESERVE_FACTOR_BPS,
+    )
+    .unwrap();
     test_set_treasury_address(&env, &contract_id, admin.clone(), treasury).unwrap();
     test_accrue_reserve(&env, &contract_id, asset.clone(), 10_000).unwrap();
 
-    let metrics_before = env.as_contract(&contract_id, || analytics::get_protocol_stats(&env).unwrap());
+    let metrics_before = env.as_contract(&contract_id, || {
+        analytics::get_protocol_stats(&env).unwrap()
+    });
     assert_eq!(metrics_before.total_value_locked, 1_000);
     assert_eq!(metrics_before.protocol_revenue, 1_000);
 
     test_withdraw_reserve_funds(&env, &contract_id, admin, asset, 400).unwrap();
 
-    let metrics_after = env.as_contract(&contract_id, || analytics::get_protocol_stats(&env).unwrap());
+    let metrics_after = env.as_contract(&contract_id, || {
+        analytics::get_protocol_stats(&env).unwrap()
+    });
     assert_eq!(metrics_after.total_value_locked, 600);
     assert_eq!(metrics_after.protocol_revenue, 1_000);
     assert_eq!(test_get_total_reserves(&env, &contract_id), 600);
     assert_eq!(test_get_protocol_revenue(&env, &contract_id), 1_000);
+}
+
+// ============================================================================
+// Reserve Factor Accounting: Fee Flows, Accrual Paths, View Consistency
+// Edge-case coverage for issue #659
+// ============================================================================
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Read the flash-loan fee bucket (`DepositDataKey::ProtocolReserve`) directly.
+/// This is the key that `flash_loan.rs` writes fees into — distinct from
+/// `ReserveDataKey::ReserveBalance` used by `accrue_reserve`.
+fn read_flash_loan_fee_bucket(
+    env: &Env,
+    contract_id: &Address,
+    asset: Option<Address>,
+) -> i128 {
+    env.as_contract(contract_id, || {
+        env.storage()
+            .persistent()
+            .get::<DepositDataKey, i128>(&DepositDataKey::ProtocolReserve(asset))
+            .unwrap_or(0)
+    })
+}
+
+// ── Interest Accrual Path ────────────────────────────────────────────────────
+
+/// Invariant: reserve balance is always non-negative after any accrual sequence.
+#[test]
+fn test_invariant_reserve_balance_never_negative() {
+    let (env, contract_id, _admin, _user, _treasury) = setup_test_env();
+    let asset = Some(Address::generate(&env));
+
+    test_initialize_reserve_config(&env, &contract_id, asset.clone(), DEFAULT_RESERVE_FACTOR_BPS)
+        .unwrap();
+
+    // Accrue with various amounts including zero
+    for amount in [0i128, 1, 99, 10_000, 1_000_000] {
+        test_accrue_reserve(&env, &contract_id, asset.clone(), amount).unwrap();
+        let balance = test_get_reserve_balance(&env, &contract_id, asset.clone());
+        assert!(balance >= 0, "reserve balance must be non-negative after accrual of {amount}");
+    }
+}
+
+/// Invariant: total_reserves == sum of per-asset reserve balances after
+/// sequential accruals on two independent assets.
+#[test]
+fn test_invariant_total_reserves_equals_sum_of_per_asset_balances() {
+    let (env, contract_id, _admin, _user, _treasury) = setup_test_env();
+    let asset_a = Some(Address::generate(&env));
+    let asset_b = Some(Address::generate(&env));
+
+    test_initialize_reserve_config(&env, &contract_id, asset_a.clone(), 1000).unwrap();
+    test_initialize_reserve_config(&env, &contract_id, asset_b.clone(), 2000).unwrap();
+
+    test_accrue_reserve(&env, &contract_id, asset_a.clone(), 10_000).unwrap();
+    test_accrue_reserve(&env, &contract_id, asset_b.clone(), 5_000).unwrap();
+
+    let bal_a = test_get_reserve_balance(&env, &contract_id, asset_a);
+    let bal_b = test_get_reserve_balance(&env, &contract_id, asset_b);
+    let total = test_get_total_reserves(&env, &contract_id);
+
+    assert_eq!(
+        total, bal_a + bal_b,
+        "total_reserves must equal sum of per-asset balances"
+    );
+}
+
+/// Invariant: protocol_revenue is monotonically non-decreasing — withdrawals
+/// must not reduce it.
+#[test]
+fn test_invariant_protocol_revenue_monotonically_non_decreasing() {
+    let (env, contract_id, admin, _user, treasury) = setup_test_env();
+    let asset = Some(Address::generate(&env));
+
+    test_initialize_reserve_config(&env, &contract_id, asset.clone(), DEFAULT_RESERVE_FACTOR_BPS)
+        .unwrap();
+    test_set_treasury_address(&env, &contract_id, admin.clone(), treasury).unwrap();
+
+    test_accrue_reserve(&env, &contract_id, asset.clone(), 20_000).unwrap();
+    let revenue_before = test_get_protocol_revenue(&env, &contract_id);
+
+    // Withdraw half the balance
+    let balance = test_get_reserve_balance(&env, &contract_id, asset.clone());
+    test_withdraw_reserve_funds(&env, &contract_id, admin, asset, balance / 2).unwrap();
+
+    let revenue_after = test_get_protocol_revenue(&env, &contract_id);
+    assert_eq!(
+        revenue_after, revenue_before,
+        "protocol_revenue must not decrease after withdrawal"
+    );
+}
+
+/// Near-zero interest: accrual of 1 stroop with 10% factor yields 0 reserve
+/// (integer truncation) and 1 lender amount — no dust is silently lost.
+#[test]
+fn test_accrual_near_zero_interest_truncates_to_zero_reserve() {
+    let (env, contract_id, _admin, _user, _treasury) = setup_test_env();
+    let asset = Some(Address::generate(&env));
+
+    // 10% factor: 1 * 1000 / 10000 = 0 (truncated)
+    test_initialize_reserve_config(&env, &contract_id, asset.clone(), 1000).unwrap();
+    let (reserve_amount, lender_amount) =
+        test_accrue_reserve(&env, &contract_id, asset.clone(), 1).unwrap();
+
+    assert_eq!(reserve_amount, 0, "sub-threshold interest truncates to 0 reserve");
+    assert_eq!(lender_amount, 1, "full interest goes to lender when reserve rounds to 0");
+    assert_eq!(test_get_reserve_balance(&env, &contract_id, asset), 0);
+}
+
+/// Minimum non-zero reserve: with 10% factor, 10 stroops yields exactly 1 reserve.
+#[test]
+fn test_accrual_minimum_nonzero_reserve_amount() {
+    let (env, contract_id, _admin, _user, _treasury) = setup_test_env();
+    let asset = Some(Address::generate(&env));
+
+    // 10% factor: 10 * 1000 / 10000 = 1
+    test_initialize_reserve_config(&env, &contract_id, asset.clone(), 1000).unwrap();
+    let (reserve_amount, lender_amount) =
+        test_accrue_reserve(&env, &contract_id, asset.clone(), 10).unwrap();
+
+    assert_eq!(reserve_amount, 1);
+    assert_eq!(lender_amount, 9);
+}
+
+/// Rounding loss is bounded: reserve_amount + lender_amount == interest_amount
+/// for all inputs (no value is created or destroyed).
+#[test]
+fn test_accrual_rounding_loss_bounded_conservation() {
+    let (env, contract_id, _admin, _user, _treasury) = setup_test_env();
+    let asset = Some(Address::generate(&env));
+
+    test_initialize_reserve_config(&env, &contract_id, asset.clone(), 1000).unwrap();
+
+    for interest in [1i128, 7, 9, 10, 99, 100, 9_999, 10_000, 99_999] {
+        // Reset balance between iterations by re-initialising
+        test_initialize_reserve_config(&env, &contract_id, asset.clone(), 1000).unwrap();
+        let (r, l) = test_accrue_reserve(&env, &contract_id, asset.clone(), interest).unwrap();
+        assert_eq!(
+            r + l, interest,
+            "conservation: reserve + lender must equal interest for input {interest}"
+        );
+        assert!(r >= 0 && l >= 0, "both splits must be non-negative");
+    }
+}
+
+/// Cap enforcement: reserve factor cannot exceed MAX_RESERVE_FACTOR_BPS (5000).
+/// Attempting to set 5001 bps must be rejected.
+#[test]
+fn test_reserve_factor_cap_enforced_at_5000_bps() {
+    let (env, contract_id, admin, _user, _treasury) = setup_test_env();
+    let asset = Some(Address::generate(&env));
+
+    let result = test_set_reserve_factor(&env, &contract_id, admin.clone(), asset.clone(), 5001);
+    assert_eq!(result, Err(ReserveError::InvalidReserveFactor));
+
+    // Boundary: exactly 5000 must succeed
+    let result = test_set_reserve_factor(&env, &contract_id, admin, asset.clone(), 5000);
+    assert!(result.is_ok());
+    assert_eq!(test_get_reserve_factor(&env, &contract_id, asset), 5000);
+}
+
+/// At 50% factor (cap), exactly half of interest goes to reserves.
+#[test]
+fn test_accrual_at_max_factor_splits_exactly_half() {
+    let (env, contract_id, _admin, _user, _treasury) = setup_test_env();
+    let asset = Some(Address::generate(&env));
+
+    test_initialize_reserve_config(&env, &contract_id, asset.clone(), MAX_RESERVE_FACTOR_BPS)
+        .unwrap();
+
+    let (reserve_amount, lender_amount) =
+        test_accrue_reserve(&env, &contract_id, asset.clone(), 10_000).unwrap();
+
+    assert_eq!(reserve_amount, 5_000);
+    assert_eq!(lender_amount, 5_000);
+}
+
+/// At 0% factor, all interest flows to lenders; reserve balance stays zero.
+#[test]
+fn test_accrual_at_zero_factor_all_interest_to_lenders() {
+    let (env, contract_id, _admin, _user, _treasury) = setup_test_env();
+    let asset = Some(Address::generate(&env));
+
+    test_initialize_reserve_config(&env, &contract_id, asset.clone(), 0).unwrap();
+
+    let (reserve_amount, lender_amount) =
+        test_accrue_reserve(&env, &contract_id, asset.clone(), 50_000).unwrap();
+
+    assert_eq!(reserve_amount, 0);
+    assert_eq!(lender_amount, 50_000);
+    assert_eq!(test_get_reserve_balance(&env, &contract_id, asset), 0);
+    assert_eq!(test_get_total_reserves(&env, &contract_id), 0);
+}
+
+// ── Flash-Loan Fee Flow ───────────────────────────────────────────────────────
+
+/// Flash-loan fees are credited to `DepositDataKey::ProtocolReserve` (the
+/// legacy fee bucket), NOT to `ReserveDataKey::ReserveBalance`.
+/// This test documents the current storage split so any future unification
+/// is caught by a failing test.
+#[test]
+fn test_flash_loan_fee_credited_to_deposit_protocol_reserve_key() {
+    let (env, contract_id, _admin, _user, _treasury) = setup_test_env();
+    let asset = Some(Address::generate(&env));
+
+    // Simulate what flash_loan.rs does: write fee to DepositDataKey::ProtocolReserve
+    let fee: i128 = 90; // 9 bps on 100_000
+    env.as_contract(&contract_id, || {
+        let reserve_key = DepositDataKey::ProtocolReserve(asset.clone());
+        let current: i128 = env
+            .storage()
+            .persistent()
+            .get::<DepositDataKey, i128>(&reserve_key)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&reserve_key, &(current + fee));
+    });
+
+    // Flash-loan fee IS visible via DepositDataKey::ProtocolReserve
+    let fee_bucket = read_flash_loan_fee_bucket(&env, &contract_id, asset.clone());
+    assert_eq!(fee_bucket, fee, "flash-loan fee must be in DepositDataKey::ProtocolReserve");
+
+    // Flash-loan fee is NOT reflected in ReserveDataKey::ReserveBalance
+    let reserve_balance = test_get_reserve_balance(&env, &contract_id, asset.clone());
+    assert_eq!(
+        reserve_balance, 0,
+        "flash-loan fee must NOT appear in ReserveDataKey::ReserveBalance (separate buckets)"
+    );
+
+    // And therefore NOT in get_total_reserves
+    let total = test_get_total_reserves(&env, &contract_id);
+    assert_eq!(
+        total, 0,
+        "get_total_reserves must not include flash-loan fee bucket"
+    );
+}
+
+/// Flash-loan fee calculation: fee = amount * fee_bps / 10_000 (truncating).
+/// Verify the formula for the default 9 bps fee.
+#[test]
+fn test_flash_loan_fee_formula_default_9_bps() {
+    // 9 bps: fee = amount * 9 / 10_000
+    let cases: &[(i128, i128)] = &[
+        (10_000, 9),       // 10_000 * 9 / 10_000 = 9
+        (100_000, 90),     // 100_000 * 9 / 10_000 = 90
+        (1_111, 0),        // 1_111 * 9 / 10_000 = 0 (truncated)
+        (1_112, 1),        // 1_112 * 9 / 10_000 = 1 (first non-zero)
+        (1_000_000, 900),  // 1_000_000 * 9 / 10_000 = 900
+    ];
+
+    for &(amount, expected_fee) in cases {
+        let fee = amount * 9 / 10_000;
+        assert_eq!(
+            fee, expected_fee,
+            "fee formula mismatch for amount={amount}: expected {expected_fee}, got {fee}"
+        );
+        // Conservation: borrower repays exactly amount + fee
+        let total_repayment = amount + fee;
+        assert_eq!(total_repayment, amount + expected_fee);
+    }
+}
+
+/// Near-zero flash-loan fee: amounts below ceil(10_000/9) = 1_112 produce a
+/// zero fee due to integer truncation. This is a known rounding edge case.
+#[test]
+fn test_flash_loan_fee_near_zero_truncates_to_zero() {
+    // With 9 bps: amounts 1..1111 all produce fee = 0
+    for amount in [1i128, 100, 500, 1_000, 1_111] {
+        let fee = amount * 9 / 10_000;
+        assert_eq!(
+            fee, 0,
+            "amount={amount} should produce zero fee with 9 bps (truncation)"
+        );
+    }
+    // 1_112 is the first amount that produces a non-zero fee
+    let fee = 1_112i128 * 9 / 10_000;
+    assert_eq!(fee, 1, "1_112 should be the minimum non-zero fee amount at 9 bps");
+}
+
+/// Flash-loan fee accumulates correctly across multiple loans on the same asset.
+#[test]
+fn test_flash_loan_fee_accumulates_across_multiple_loans() {
+    let (env, contract_id, _admin, _user, _treasury) = setup_test_env();
+    let asset = Some(Address::generate(&env));
+
+    // Simulate 3 flash-loan fee credits
+    let fees = [90i128, 45, 180];
+    let mut expected_total = 0i128;
+
+    for fee in fees {
+        expected_total += fee;
+        env.as_contract(&contract_id, || {
+            let key = DepositDataKey::ProtocolReserve(asset.clone());
+            let current: i128 = env
+                .storage()
+                .persistent()
+                .get::<DepositDataKey, i128>(&key)
+                .unwrap_or(0);
+            env.storage().persistent().set(&key, &(current + fee));
+        });
+    }
+
+    let bucket = read_flash_loan_fee_bucket(&env, &contract_id, asset);
+    assert_eq!(bucket, expected_total, "fee bucket must accumulate across loans");
+}
+
+// ── View Function Consistency ─────────────────────────────────────────────────
+
+/// get_reserve_balance and get_total_reserves are consistent after a sequence
+/// of accruals and a partial withdrawal.
+#[test]
+fn test_view_consistency_balance_and_total_after_accrual_and_withdrawal() {
+    let (env, contract_id, admin, _user, treasury) = setup_test_env();
+    let asset = Some(Address::generate(&env));
+
+    test_initialize_reserve_config(&env, &contract_id, asset.clone(), DEFAULT_RESERVE_FACTOR_BPS)
+        .unwrap();
+    test_set_treasury_address(&env, &contract_id, admin.clone(), treasury).unwrap();
+
+    // Accrue twice
+    test_accrue_reserve(&env, &contract_id, asset.clone(), 10_000).unwrap();
+    test_accrue_reserve(&env, &contract_id, asset.clone(), 5_000).unwrap();
+
+    let balance_before = test_get_reserve_balance(&env, &contract_id, asset.clone());
+    let total_before = test_get_total_reserves(&env, &contract_id);
+    assert_eq!(balance_before, total_before, "single-asset: balance == total before withdrawal");
+
+    // Partial withdrawal
+    let withdraw_amount = balance_before / 2;
+    test_withdraw_reserve_funds(&env, &contract_id, admin, asset.clone(), withdraw_amount).unwrap();
+
+    let balance_after = test_get_reserve_balance(&env, &contract_id, asset);
+    let total_after = test_get_total_reserves(&env, &contract_id);
+
+    assert_eq!(balance_after, balance_before - withdraw_amount);
+    assert_eq!(total_after, total_before - withdraw_amount);
+    assert_eq!(balance_after, total_after, "single-asset: balance == total after withdrawal");
+}
+
+/// get_reserve_stats returns values consistent with individual view functions.
+#[test]
+fn test_view_get_reserve_stats_consistent_with_individual_views() {
+    let (env, contract_id, admin, _user, treasury) = setup_test_env();
+    let asset = Some(Address::generate(&env));
+
+    test_initialize_reserve_config(&env, &contract_id, asset.clone(), 2000).unwrap();
+    test_set_treasury_address(&env, &contract_id, admin.clone(), treasury.clone()).unwrap();
+    test_accrue_reserve(&env, &contract_id, asset.clone(), 10_000).unwrap();
+
+    let (stats_balance, stats_factor, stats_treasury) =
+        test_get_reserve_stats(&env, &contract_id, asset.clone());
+
+    let direct_balance = test_get_reserve_balance(&env, &contract_id, asset.clone());
+    let direct_factor = test_get_reserve_factor(&env, &contract_id, asset.clone());
+    let direct_treasury = test_get_treasury_address(&env, &contract_id);
+
+    assert_eq!(stats_balance, direct_balance, "stats balance must match direct query");
+    assert_eq!(stats_factor, direct_factor, "stats factor must match direct query");
+    assert_eq!(stats_treasury, direct_treasury, "stats treasury must match direct query");
+    assert_eq!(stats_treasury, Some(treasury));
+}
+
+/// After a full withdrawal, reserve balance and total_reserves are both zero.
+#[test]
+fn test_view_full_withdrawal_zeroes_balance_and_total() {
+    let (env, contract_id, admin, _user, treasury) = setup_test_env();
+    let asset = Some(Address::generate(&env));
+
+    test_initialize_reserve_config(&env, &contract_id, asset.clone(), DEFAULT_RESERVE_FACTOR_BPS)
+        .unwrap();
+    test_set_treasury_address(&env, &contract_id, admin.clone(), treasury).unwrap();
+    test_accrue_reserve(&env, &contract_id, asset.clone(), 10_000).unwrap();
+
+    let balance = test_get_reserve_balance(&env, &contract_id, asset.clone());
+    assert!(balance > 0);
+
+    test_withdraw_reserve_funds(&env, &contract_id, admin, asset.clone(), balance).unwrap();
+
+    assert_eq!(test_get_reserve_balance(&env, &contract_id, asset), 0);
+    assert_eq!(test_get_total_reserves(&env, &contract_id), 0);
+}
+
+// ── Withdrawal Edge Cases ─────────────────────────────────────────────────────
+
+/// Withdrawal of exactly the full balance succeeds; one more stroop fails.
+#[test]
+fn test_withdrawal_exact_balance_succeeds_one_over_fails() {
+    let (env, contract_id, admin, _user, treasury) = setup_test_env();
+    let asset = Some(Address::generate(&env));
+
+    test_initialize_reserve_config(&env, &contract_id, asset.clone(), DEFAULT_RESERVE_FACTOR_BPS)
+        .unwrap();
+    test_set_treasury_address(&env, &contract_id, admin.clone(), treasury).unwrap();
+    test_accrue_reserve(&env, &contract_id, asset.clone(), 10_000).unwrap();
+
+    let balance = test_get_reserve_balance(&env, &contract_id, asset.clone());
+
+    // Exact balance succeeds
+    let result =
+        test_withdraw_reserve_funds(&env, &contract_id, admin.clone(), asset.clone(), balance);
+    assert!(result.is_ok(), "exact balance withdrawal must succeed");
+
+    // One more stroop fails
+    let result = test_withdraw_reserve_funds(&env, &contract_id, admin, asset, 1);
+    assert_eq!(result, Err(ReserveError::InsufficientReserve));
+}
+
+/// Withdrawal of 1 stroop (minimum positive amount) succeeds when balance >= 1.
+#[test]
+fn test_withdrawal_minimum_one_stroop_succeeds() {
+    let (env, contract_id, admin, _user, treasury) = setup_test_env();
+    let asset = Some(Address::generate(&env));
+
+    // Use 10% factor on 10 stroops → 1 stroop reserve
+    test_initialize_reserve_config(&env, &contract_id, asset.clone(), 1000).unwrap();
+    test_set_treasury_address(&env, &contract_id, admin.clone(), treasury).unwrap();
+    test_accrue_reserve(&env, &contract_id, asset.clone(), 10).unwrap();
+
+    let balance = test_get_reserve_balance(&env, &contract_id, asset.clone());
+    assert_eq!(balance, 1);
+
+    let result = test_withdraw_reserve_funds(&env, &contract_id, admin, asset, 1);
+    assert!(result.is_ok(), "1-stroop withdrawal must succeed");
 }

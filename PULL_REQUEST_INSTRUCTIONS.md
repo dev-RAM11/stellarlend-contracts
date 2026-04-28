@@ -1,5 +1,9 @@
 # Pull Request Creation Instructions
 
+> **Contract PRs**: before opening a review, work through the
+> [Contracts Release Checklist](docs/release_checklist.md) and paste the
+> completed checklist into your PR description.
+
 ## ✅ Successfully Pushed to Forked Repository
 
 **Branch**: `Add-audit-logging-for-all-financial-operations`  
