@@ -23,6 +23,18 @@ fn action_payload(env: &Env, action: &str) -> soroban_sdk::Vec<soroban_sdk::Val>
     (Symbol::new(env, action),).into_val(env)
 }
 
+fn versioned_payload(env: &Env, version: u32, action: &str) -> soroban_sdk::Vec<soroban_sdk::Val> {
+    (version, Symbol::new(env, action)).into_val(env)
+}
+
+fn malformed_payload(env: &Env) -> soroban_sdk::Vec<soroban_sdk::Val> {
+    // Create a payload with invalid types
+    let mut payload = soroban_sdk::Vec::new(env);
+    payload.push_back(1u32.into_val(env)); // valid version
+    payload.push_back(123456u32.into_val(env)); // invalid action type (should be Symbol)
+    payload
+}
+
 fn register_token(env: &Env, admin: &Address) -> Address {
     env.register_stellar_asset_contract_v2(admin.clone())
         .address()
@@ -71,7 +83,7 @@ fn test_receive_invalid_action() {
     mint_and_approve(&env, &asset, &from, &contract_id, 50_000);
     let token_client = token::Client::new(&env, &asset);
 
-    let result = client.try_receive(&asset, &from, &50_000, &action_payload(&env, "withdraw"));
+    let result = client.try_receive(&asset, &from, &50_000, &versioned_payload(&env, 1, "withdraw"));
     assert_eq!(result, Err(Ok(BorrowError::AssetNotSupported)));
     assert_eq!(token_client.balance(&from), 50_000);
     assert_eq!(token_client.balance(&contract_id), 0);
@@ -84,7 +96,7 @@ fn test_receive_requires_allowance() {
     let asset = register_token_in_registry(&env, &client, &admin);
     mint(&env, &asset, &from, 10_000);
 
-    let result = client.try_receive(&asset, &from, &10_000, &action_payload(&env, "deposit"));
+    let result = client.try_receive(&asset, &from, &10_000, &versioned_payload(&env, 1, "deposit"));
     assert_eq!(result, Err(Ok(BorrowError::Unauthorized)));
 }
 
@@ -96,7 +108,7 @@ fn test_receive_deposit_success() {
     mint_and_approve(&env, &asset, &from, &contract_id, 50_000);
     let token_client = token::Client::new(&env, &asset);
 
-    client.receive(&asset, &from, &50_000, &action_payload(&env, "deposit"));
+    client.receive(&asset, &from, &50_000, &versioned_payload(&env, 1, "deposit"));
 
     let collateral = client.get_user_collateral(&from);
     assert_eq!(collateral.amount, 50_000);
@@ -110,7 +122,7 @@ fn test_receive_deposit_accumulates_collateral() {
     let (env, contract_id, client, admin) = setup();
     let from = Address::generate(&env);
     let asset = register_token_in_registry(&env, &client, &admin);
-    let payload = action_payload(&env, "deposit");
+    let payload = versioned_payload(&env, 1, "deposit");
     mint_and_approve(&env, &asset, &from, &contract_id, 50_000);
 
     client.receive(&asset, &from, &30_000, &payload);
@@ -130,7 +142,7 @@ fn test_receive_deposit_zero_amount() {
     let from = Address::generate(&env);
     let asset = register_token_in_registry(&env, &client, &admin);
 
-    let result = client.try_receive(&asset, &from, &0, &action_payload(&env, "deposit"));
+    let result = client.try_receive(&asset, &from, &0, &versioned_payload(&env, 1, "deposit"));
     assert_eq!(result, Err(Ok(BorrowError::InvalidAmount)));
 }
 
@@ -140,7 +152,7 @@ fn test_receive_deposit_negative_amount() {
     let from = Address::generate(&env);
     let asset = register_token_in_registry(&env, &client, &admin);
 
-    let result = client.try_receive(&asset, &from, &-1, &action_payload(&env, "deposit"));
+    let result = client.try_receive(&asset, &from, &-1, &versioned_payload(&env, 1, "deposit"));
     assert_eq!(result, Err(Ok(BorrowError::InvalidAmount)));
 }
 
@@ -150,7 +162,7 @@ fn test_receive_deposit_asset_mismatch() {
     let from = Address::generate(&env);
     let asset_a = register_token_in_registry(&env, &client, &admin);
     let asset_b = register_token_in_registry(&env, &client, &admin);
-    let payload = action_payload(&env, "deposit");
+    let payload = versioned_payload(&env, 1, "deposit");
     mint_and_approve(&env, &asset_a, &from, &contract_id, 10_000);
     mint_and_approve(&env, &asset_b, &from, &contract_id, 10_000);
 
@@ -170,7 +182,7 @@ fn test_receive_deposit_overflow() {
     client.deposit_collateral(&from, &asset, &i128::MAX);
     mint_and_approve(&env, &asset, &from, &contract_id, 1);
 
-    let result = client.try_receive(&asset, &from, &1, &action_payload(&env, "deposit"));
+    let result = client.try_receive(&asset, &from, &1, &versioned_payload(&env, 1, "deposit"));
     assert_eq!(result, Err(Ok(BorrowError::Overflow)));
     assert_eq!(token::Client::new(&env, &asset).balance(&contract_id), 0);
 }
@@ -184,7 +196,7 @@ fn test_receive_deposit_respects_deposit_pause() {
 
     client.set_pause(&admin, &PauseType::Deposit, &true);
 
-    let result = client.try_receive(&asset, &from, &50_000, &action_payload(&env, "deposit"));
+    let result = client.try_receive(&asset, &from, &50_000, &versioned_payload(&env, 1, "deposit"));
     assert_eq!(result, Err(Ok(BorrowError::ProtocolPaused)));
     assert_eq!(token::Client::new(&env, &asset).balance(&from), 50_000);
 }
@@ -198,7 +210,7 @@ fn test_receive_deposit_respects_global_pause() {
 
     client.set_pause(&admin, &PauseType::All, &true);
 
-    let result = client.try_receive(&asset, &from, &50_000, &action_payload(&env, "deposit"));
+    let result = client.try_receive(&asset, &from, &50_000, &versioned_payload(&env, 1, "deposit"));
     assert_eq!(result, Err(Ok(BorrowError::ProtocolPaused)));
     assert_eq!(token::Client::new(&env, &asset).balance(&contract_id), 0);
 }
@@ -212,7 +224,7 @@ fn test_receive_repay_success() {
     mint_and_approve(&env, &asset, &from, &contract_id, 5_000);
 
     client.borrow(&from, &asset, &10_000, &collateral_asset, &20_000);
-    client.receive(&asset, &from, &5_000, &action_payload(&env, "repay"));
+    client.receive(&asset, &from, &5_000, &versioned_payload(&env, 1, "repay"));
 
     let debt = client.get_user_debt(&from);
     assert_eq!(debt.borrowed_amount, 5_000);
@@ -232,7 +244,7 @@ fn test_receive_repay_full_debt() {
     mint_and_approve(&env, &asset, &from, &contract_id, 10_000);
 
     client.borrow(&from, &asset, &10_000, &collateral_asset, &20_000);
-    client.receive(&asset, &from, &10_000, &action_payload(&env, "repay"));
+    client.receive(&asset, &from, &10_000, &versioned_payload(&env, 1, "repay"));
 
     let debt = client.get_user_debt(&from);
     assert_eq!(debt.borrowed_amount, 0);
@@ -253,7 +265,7 @@ fn test_receive_repay_interest_repaid_first() {
     const SECONDS_PER_YEAR: u64 = 31_536_000;
     env.ledger().with_mut(|li| li.timestamp = SECONDS_PER_YEAR);
 
-    client.receive(&asset, &from, &500, &action_payload(&env, "repay"));
+    client.receive(&asset, &from, &500, &versioned_payload(&env, 1, "repay"));
 
     let debt = client.get_user_debt(&from);
     assert_eq!(debt.borrowed_amount, 10_000);
@@ -269,7 +281,7 @@ fn test_receive_repay_zero_amount() {
 
     client.borrow(&from, &asset, &10_000, &collateral_asset, &20_000);
 
-    let result = client.try_receive(&asset, &from, &0, &action_payload(&env, "repay"));
+    let result = client.try_receive(&asset, &from, &0, &versioned_payload(&env, 1, "repay"));
     assert_eq!(result, Err(Ok(BorrowError::InvalidAmount)));
 }
 
@@ -282,7 +294,7 @@ fn test_receive_repay_negative_amount() {
 
     client.borrow(&from, &asset, &10_000, &collateral_asset, &20_000);
 
-    let result = client.try_receive(&asset, &from, &-500, &action_payload(&env, "repay"));
+    let result = client.try_receive(&asset, &from, &-500, &versioned_payload(&env, 1, "repay"));
     assert_eq!(result, Err(Ok(BorrowError::InvalidAmount)));
 }
 
@@ -293,7 +305,7 @@ fn test_receive_repay_no_debt() {
     let asset = register_token_in_registry(&env, &client, &admin);
     mint_and_approve(&env, &asset, &from, &contract_id, 5_000);
 
-    let result = client.try_receive(&asset, &from, &5_000, &action_payload(&env, "repay"));
+    let result = client.try_receive(&asset, &from, &5_000, &versioned_payload(&env, 1, "repay"));
     assert_eq!(result, Err(Ok(BorrowError::InvalidAmount)));
     assert_eq!(token::Client::new(&env, &asset).balance(&contract_id), 0);
 }
@@ -309,7 +321,7 @@ fn test_receive_repay_wrong_asset() {
 
     client.borrow(&from, &borrow_asset, &10_000, &collateral_asset, &20_000);
 
-    let result = client.try_receive(&wrong_asset, &from, &5_000, &action_payload(&env, "repay"));
+    let result = client.try_receive(&wrong_asset, &from, &5_000, &versioned_payload(&env, 1, "repay"));
     assert_eq!(result, Err(Ok(BorrowError::AssetNotSupported)));
     assert_eq!(
         token::Client::new(&env, &wrong_asset).balance(&contract_id),
@@ -327,7 +339,7 @@ fn test_receive_repay_overpayment() {
 
     client.borrow(&from, &asset, &10_000, &collateral_asset, &20_000);
 
-    let result = client.try_receive(&asset, &from, &10_001, &action_payload(&env, "repay"));
+    let result = client.try_receive(&asset, &from, &10_001, &versioned_payload(&env, 1, "repay"));
     assert_eq!(result, Err(Ok(BorrowError::RepayAmountTooHigh)));
     assert_eq!(token::Client::new(&env, &asset).balance(&contract_id), 0);
 }
@@ -343,7 +355,7 @@ fn test_receive_repay_respects_repay_pause() {
     client.borrow(&from, &asset, &10_000, &collateral_asset, &20_000);
     client.set_pause(&admin, &PauseType::Repay, &true);
 
-    let result = client.try_receive(&asset, &from, &5_000, &action_payload(&env, "repay"));
+    let result = client.try_receive(&asset, &from, &5_000, &versioned_payload(&env, 1, "repay"));
     assert_eq!(result, Err(Ok(BorrowError::ProtocolPaused)));
     assert_eq!(token::Client::new(&env, &asset).balance(&from), 5_000);
 }
@@ -359,7 +371,7 @@ fn test_receive_repay_respects_global_pause() {
     client.borrow(&from, &asset, &10_000, &collateral_asset, &20_000);
     client.set_pause(&admin, &PauseType::All, &true);
 
-    let result = client.try_receive(&asset, &from, &5_000, &action_payload(&env, "repay"));
+    let result = client.try_receive(&asset, &from, &5_000, &versioned_payload(&env, 1, "repay"));
     assert_eq!(result, Err(Ok(BorrowError::ProtocolPaused)));
     assert_eq!(token::Client::new(&env, &asset).balance(&contract_id), 0);
 }
@@ -384,7 +396,7 @@ fn test_receive_deposit_exceeds_cap() {
     let (env, contract_id, client, admin) = setup();
     let from = Address::generate(&env);
     let asset = register_token(&env, &admin);
-    let payload = action_payload(&env, "deposit");
+    let payload = versioned_payload(&env, 1, "deposit");
 
     // Set cap to 50k
     client.initialize_deposit_settings(&50_000, &100);
@@ -409,7 +421,7 @@ fn test_receive_deposit_at_cap_boundary() {
     let (env, contract_id, client, admin) = setup();
     let from = Address::generate(&env);
     let asset = register_token(&env, &admin);
-    let payload = action_payload(&env, "deposit");
+    let payload = versioned_payload(&env, 1, "deposit");
 
     // Set cap to 50k
     client.initialize_deposit_settings(&50_000, &100);
@@ -424,4 +436,186 @@ fn test_receive_deposit_at_cap_boundary() {
     mint_and_approve(&env, &asset, &from, &contract_id, 1);
     let result = client.try_receive(&asset, &from, &1, &payload);
     assert_eq!(result, Err(Ok(BorrowError::ExceedsDepositCap)));
+}
+
+// ===== SECURITY TESTS =====
+
+#[test]
+fn test_receive_payload_version_invalid() {
+    let (env, _contract_id, client, admin) = setup();
+    let from = Address::generate(&env);
+    let asset = register_token_in_registry(&env, &client, &admin);
+    mint_and_approve(&env, &asset, &from, &env.current_contract_address(), 10_000);
+
+    // Test with wrong version (version 0)
+    let result = client.try_receive(&asset, &from, &10_000, &versioned_payload(&env, 0, "deposit"));
+    assert_eq!(result, Err(Ok(BorrowError::InvalidPayloadVersion)));
+
+    // Test with wrong version (version 2)
+    let result = client.try_receive(&asset, &from, &10_000, &versioned_payload(&env, 2, "deposit"));
+    assert_eq!(result, Err(Ok(BorrowError::InvalidPayloadVersion)));
+
+    // Test with future version (version 999)
+    let result = client.try_receive(&asset, &from, &10_000, &versioned_payload(&env, 999, "deposit"));
+    assert_eq!(result, Err(Ok(BorrowError::InvalidPayloadVersion)));
+}
+
+#[test]
+fn test_receive_payload_malformed_structure() {
+    let (env, _contract_id, client, admin) = setup();
+    let from = Address::generate(&env);
+    let asset = register_token_in_registry(&env, &client, &admin);
+    mint_and_approve(&env, &asset, &from, &env.current_contract_address(), 10_000);
+
+    // Test with empty payload
+    let empty_payload: soroban_sdk::Vec<soroban_sdk::Val> = soroban_sdk::Vec::new(&env);
+    let result = client.try_receive(&asset, &from, &10_000, &empty_payload);
+    assert_eq!(result, Err(Ok(BorrowError::MalformedPayload)));
+
+    // Test with single element payload (missing action)
+    let mut single_payload = soroban_sdk::Vec::new(&env);
+    single_payload.push_back(1u32.into_val(&env));
+    let result = client.try_receive(&asset, &from, &10_000, &single_payload);
+    assert_eq!(result, Err(Ok(BorrowError::MalformedPayload)));
+
+    // Test with malformed payload (wrong action type)
+    let result = client.try_receive(&asset, &from, &10_000, &malformed_payload(&env));
+    assert_eq!(result, Err(Ok(BorrowError::MalformedPayload)));
+}
+
+#[test]
+fn test_receive_payload_too_long() {
+    let (env, _contract_id, client, admin) = setup();
+    let from = Address::generate(&env);
+    let asset = register_token_in_registry(&env, &client, &admin);
+    mint_and_approve(&env, &asset, &from, &env.current_contract_address(), 10_000);
+
+    // Create payload that exceeds MAX_PAYLOAD_LENGTH
+    let mut oversized_payload = soroban_sdk::Vec::new(&env);
+    oversized_payload.push_back(1u32.into_val(&env)); // version
+    oversized_payload.push_back(Symbol::new(&env, "deposit").into_val(&env)); // action
+    
+    // Add 9 more elements to exceed the limit (total 11 > MAX_PAYLOAD_LENGTH 10)
+    for i in 0..9 {
+        oversized_payload.push_back(i.into_val(&env));
+    }
+
+    let result = client.try_receive(&asset, &from, &10_000, &oversized_payload);
+    assert_eq!(result, Err(Ok(BorrowError::MalformedPayload)));
+}
+
+#[test]
+fn test_receive_unauthorized_sender_token_contract() {
+    let (env, _contract_id, client, admin) = setup();
+    let asset = register_token_in_registry(&env, &client, &admin);
+    mint(&env, &asset, &asset, 10_000); // Mint tokens to the token contract itself
+    
+    // Try to have the token contract call receive directly
+    let result = client.try_receive(&asset, &asset, &10_000, &versioned_payload(&env, 1, "deposit"));
+    assert_eq!(result, Err(Ok(BorrowError::UnauthorizedSender)));
+}
+
+#[test]
+fn test_receive_unauthorized_sender_lending_contract() {
+    let (env, contract_id, client, admin) = setup();
+    let asset = register_token_in_registry(&env, &client, &admin);
+    mint(&env, &asset, &contract_id, 10_000); // Mint tokens to the lending contract
+    
+    // Try to have the lending contract call receive (self-call attack)
+    let result = client.try_receive(&asset, &contract_id, &10_000, &versioned_payload(&env, 1, "deposit"));
+    assert_eq!(result, Err(Ok(BorrowError::UnauthorizedSender)));
+}
+
+#[test]
+fn test_receive_invalid_action_symbol() {
+    let (env, _contract_id, client, admin) = setup();
+    let from = Address::generate(&env);
+    let asset = register_token_in_registry(&env, &client, &admin);
+    mint_and_approve(&env, &asset, &from, &env.current_contract_address(), 10_000);
+
+    // Test with invalid action symbols
+    let invalid_actions = vec!["withdraw", "transfer", "mint", "burn", "hack", "exploit"];
+    
+    for action in invalid_actions {
+        let result = client.try_receive(&asset, &from, &10_000, &versioned_payload(&env, 1, action));
+        assert_eq!(result, Err(Ok(BorrowError::AssetNotSupported)));
+    }
+}
+
+#[test]
+fn test_receive_legacy_payload_format_rejected() {
+    let (env, _contract_id, client, admin) = setup();
+    let from = Address::generate(&env);
+    let asset = register_token_in_registry(&env, &client, &admin);
+    mint_and_approve(&env, &asset, &from, &env.current_contract_address(), 10_000);
+
+    // Test with legacy payload format (no version, just action)
+    let result = client.try_receive(&asset, &from, &10_000, &action_payload(&env, "deposit"));
+    assert_eq!(result, Err(Ok(BorrowError::MalformedPayload)));
+}
+
+#[test]
+fn test_receive_payload_version_boundary_values() {
+    let (env, _contract_id, client, admin) = setup();
+    let from = Address::generate(&env);
+    let asset = register_token_in_registry(&env, &client, &admin);
+    mint_and_approve(&env, &asset, &from, &env.current_contract_address(), 10_000);
+
+    // Test with boundary version values
+    let boundary_versions = vec![u32::MIN, u32::MAX, PAYLOAD_VERSION - 1, PAYLOAD_VERSION + 1];
+    
+    for version in boundary_versions {
+        if version != PAYLOAD_VERSION {
+            let result = client.try_receive(&asset, &from, &10_000, &versioned_payload(&env, version, "deposit"));
+            assert_eq!(result, Err(Ok(BorrowError::InvalidPayloadVersion)));
+        }
+    }
+}
+
+#[test]
+fn test_receive_successful_with_versioned_payload() {
+    let (env, contract_id, client, admin) = setup();
+    let from = Address::generate(&env);
+    let asset = register_token_in_registry(&env, &client, &admin);
+    mint_and_approve(&env, &asset, &from, &contract_id, 50_000);
+    let token_client = token::Client::new(&env, &asset);
+
+    // Test successful deposit with versioned payload
+    client.receive(&asset, &from, &50_000, &versioned_payload(&env, 1, "deposit"));
+
+    let collateral = client.get_user_collateral(&from);
+    assert_eq!(collateral.amount, 50_000);
+    assert_eq!(collateral.asset, asset);
+    assert_eq!(token_client.balance(&from), 0);
+    assert_eq!(token_client.balance(&contract_id), 50_000);
+
+    // Test successful repay with versioned payload
+    let collateral_asset = register_token_in_registry(&env, &client, &admin);
+    mint_and_approve(&env, &asset, &from, &contract_id, 5_000);
+    client.borrow(&from, &asset, &10_000, &collateral_asset, &20_000);
+    
+    client.receive(&asset, &from, &5_000, &versioned_payload(&env, 1, "repay"));
+
+    let debt = client.get_user_debt(&from);
+    assert_eq!(debt.borrowed_amount, 5_000);
+    assert_eq!(debt.interest_accrued, 0);
+}
+
+#[test]
+fn test_receive_payload_with_extra_data_ignored() {
+    let (env, contract_id, client, admin) = setup();
+    let from = Address::generate(&env);
+    let asset = register_token_in_registry(&env, &client, &admin);
+    mint_and_approve(&env, &asset, &from, &contract_id, 50_000);
+
+    // Create payload with extra data (should be ignored but allowed)
+    let mut payload_with_extra = versioned_payload(&env, 1, "deposit");
+    payload_with_extra.push_back("extra_data".into_val(&env));
+    payload_with_extra.push_back(42u32.into_val(&env));
+
+    client.receive(&asset, &from, &50_000, &payload_with_extra);
+
+    let collateral = client.get_user_collateral(&from);
+    assert_eq!(collateral.amount, 50_000);
+    assert_eq!(collateral.asset, asset);
 }

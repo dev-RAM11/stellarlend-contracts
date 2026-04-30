@@ -33,6 +33,9 @@ pub enum BorrowError {
     BorrowCapExceeded = 1011,
     InvalidBorrowCap = 1012,
     ExceedsDepositCap = 1013,
+    InvalidPayloadVersion = 1014,
+    MalformedPayload = 1015,
+    UnauthorizedSender = 1016,
 }
 
 // ── Deposits (2000–2999) ──────────────────────────────────────────────
