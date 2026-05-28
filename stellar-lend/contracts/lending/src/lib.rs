@@ -5,6 +5,9 @@ pub mod rounding_strategy;
 #[cfg(test)]
 mod interest_drift_regression_test;
 
+#[cfg(test)]
+mod zero_amount_semantics_test;
+
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
 
 #[contracttype]
@@ -18,6 +21,9 @@ pub struct PositionSummary {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum LendingError {
+    /// Returned when `amount` is zero or negative. Fires before any auth or
+    /// storage mutation so the rejection is always side-effect-free.
+    InvalidAmount = 1,
     BelowMinimumBorrow = 1008,
 }
 
@@ -50,7 +56,13 @@ impl LendingContract {
     }
 
     /// Deposit collateral for a user.
-    pub fn deposit(env: Env, user: Address, amount: i128) -> i128 {
+    ///
+    /// # Errors
+    /// - [`LendingError::InvalidAmount`] if `amount` is zero or negative.
+    pub fn deposit(env: Env, user: Address, amount: i128) -> Result<i128, LendingError> {
+        if amount <= 0 {
+            return Err(LendingError::InvalidAmount);
+        }
         // Prevent mutating during an active flash loan callback
         let active: bool = env.storage().instance().get(&"flash_active").unwrap_or(false);
         if active {
@@ -61,10 +73,17 @@ impl LendingContract {
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         let new_balance = current + amount;
         env.storage().persistent().set(&key, &new_balance);
-        new_balance
+        Ok(new_balance)
     }
 
-    pub fn withdraw(env: Env, user: Address, amount: i128) -> i128 {
+    /// Withdraw collateral for a user.
+    ///
+    /// # Errors
+    /// - [`LendingError::InvalidAmount`] if `amount` is zero or negative.
+    pub fn withdraw(env: Env, user: Address, amount: i128) -> Result<i128, LendingError> {
+        if amount <= 0 {
+            return Err(LendingError::InvalidAmount);
+        }
         // Prevent mutating during an active flash loan callback
         let active: bool = env.storage().instance().get(&"flash_active").unwrap_or(false);
         if active {
@@ -75,11 +94,18 @@ impl LendingContract {
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0);
         let new_balance = current - amount;
         env.storage().persistent().set(&key, &new_balance);
-        new_balance
+        Ok(new_balance)
     }
 
     /// Borrow against deposited collateral.
+    ///
+    /// # Errors
+    /// - [`LendingError::InvalidAmount`] if `amount` is zero or negative.
+    /// - [`LendingError::BelowMinimumBorrow`] if `amount` is below the configured minimum.
     pub fn borrow(env: Env, user: Address, amount: i128) -> Result<i128, LendingError> {
+        if amount <= 0 {
+            return Err(LendingError::InvalidAmount);
+        }
         user.require_auth();
         let min_borrow = Self::get_min_borrow(env.clone());
         if amount < min_borrow {
@@ -92,7 +118,14 @@ impl LendingContract {
         Ok(new_debt)
     }
 
-    pub fn repay(env: Env, user: Address, amount: i128) -> i128 {
+    /// Repay outstanding debt for a user.
+    ///
+    /// # Errors
+    /// - [`LendingError::InvalidAmount`] if `amount` is zero or negative.
+    pub fn repay(env: Env, user: Address, amount: i128) -> Result<i128, LendingError> {
+        if amount <= 0 {
+            return Err(LendingError::InvalidAmount);
+        }
         // Prevent mutating during an active flash loan callback
         let active: bool = env.storage().instance().get(&"flash_active").unwrap_or(false);
         if active {
@@ -104,7 +137,7 @@ impl LendingContract {
         let updated = repay_amount(position, now, amount, DEFAULT_APR_BPS)
             .unwrap_or_else(|_| panic_with_debt_error());
         save_debt(&env, &user, &updated);
-        updated.principal
+        Ok(updated.principal)
     }
 
     pub fn get_debt_position(env: Env, user: Address) -> DebtPosition {
