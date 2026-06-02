@@ -31,6 +31,7 @@ HORIZON_URL=https://horizon-testnet.stellar.org
 SOROBAN_RPC_URL=https://soroban-testnet.stellar.org
 CONTRACT_ID=<your_deployed_contract_id>
 JWT_SECRET=<your_secret_key>
+STELLAR_API_HOOK_SECRET=<your_hook_secret>
 ```
 
 Circuit breaker tuning (optional, environment variables):
@@ -53,6 +54,16 @@ CB_HALF_OPEN_TRIAL=2
 ### Health Check
 `GET /api/health` - Check service status
 
+### Deep Health Check
+- `GET /api/health/healthz` - Deep liveness and readiness check. Returns structured status and diagnostic info:
+
+  - `rpc` (boolean): whether Soroban RPC responded to health probe
+  - `contract` (boolean): whether the configured lending contract is reachable (invocation)
+  - `ledger` (number|null): latest ledger sequence observed from Horizon when available
+
+  Returns HTTP `200` when both `rpc` and `contract` are true, otherwise `503`.
+
+SLO: The service aims for 99.9% availability for `/api/health/healthz` (RPC + contract reachable). Use a short scrape interval (e.g. 10s) and alert on consecutive failures for 1 minute.
 The health endpoint now includes Soroban RPC circuit breaker metrics under `services.sorobanBreaker`:
 
 ```json
@@ -123,6 +134,28 @@ npm test -- --coverage  # With coverage report
 ```
 
 Test coverage: 95%+ (branches, functions, lines, statements)
+
+## Indexer write hook authentication
+
+The API now protects internal indexer write hooks using HMAC-SHA256 and a shared secret. Every request to `/api/lending/hooks/*` must include the following headers:
+
+- `X-Hook-Timestamp`: the request timestamp in milliseconds since epoch
+- `X-Hook-Signature`: hex-encoded HMAC-SHA256 over the string `timestamp + '.' + requestBody`
+
+The middleware rejects requests when:
+
+- the hook secret is not configured
+- either header is missing or malformed
+- the timestamp is outside a 5-minute window
+- the signature does not match the computed HMAC
+
+### Secret rotation
+
+1. Generate a new strong secret and set it as `STELLAR_API_HOOK_SECRET` in the API deployment.
+2. Update the hook sender(s) to sign requests with the new secret.
+3. Deploy the sender and API together or with an overlap window.
+4. Validate that hook requests are accepted and monitor for authentication failures.
+5. Remove the previous secret from all systems once the new secret is active.
 
 ## Production Build
 

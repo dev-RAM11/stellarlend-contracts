@@ -16,8 +16,16 @@ import axios from 'axios';
 import { config } from '../config';
 import logger from '../utils/logger';
 import { InternalServerError } from '../utils/errors';
-import { TransactionResponse, TransactionStatus } from '../types';
-import CircuitBreaker from '../utils/circuitBreaker';
+import {
+  TransactionResponse,
+  TransactionStatus,
+  AmmEventDecodeResult,
+  AmmEventKind,
+  AmmEventTopic,
+  AmmEventV1,
+  AMM_EVENT_TOPIC_MODULE,
+  AMM_EVENT_TOPIC_VERSION,
+} from '../types';
 
 export class StellarService {
   private horizonUrl: string;
@@ -276,45 +284,69 @@ export class StellarService {
     };
   }
 
-  async getProtocolMetrics(): Promise<{
-    total_supply: bigint;
-    total_borrow: bigint;
-    utilization_bps: bigint;
-    ledger: number;
-  }> {
-    try {
-      const contract = new Contract(this.contractId);
-      const operation = contract.call('get_protocol_metrics');
-
-      const tx = new TransactionBuilder(
-        new Account(this.contractId, '0'),
-        { fee: BASE_FEE, networkPassphrase: this.networkPassphrase }
-      )
-        .addOperation(operation)
-        .setTimeout(30)
-        .build();
-
-      const sim = await this.sorobanServer.simulateTransaction(tx);
-      if (!('result' in sim) || !sim.result) {
-        throw new InternalServerError('get_protocol_metrics simulation returned no result');
-      }
-
-      const fields = sim.result.retval.map().map((e: xdr.ScMapEntry) => ({
-        key: e.key().sym().toString(),
-        val: e.val(),
-      }));
-      const get = (name: string) => fields.find((f: { key: string }) => f.key === name)?.val;
-
-      return {
-        total_supply: BigInt(get('total_supply')?.i128()?.lo ?? 0),
-        total_borrow: BigInt(get('total_borrow')?.i128()?.lo ?? 0),
-        utilization_bps: BigInt(get('utilization_bps')?.i128()?.lo ?? 0),
-        ledger: get('ledger')?.u32() ?? 0,
-      };
-    } catch (error) {
-      logger.error('Failed to fetch protocol metrics:', error);
-      throw new InternalServerError('Failed to fetch protocol metrics');
+  public parseAmmEventTopic(topics: unknown): AmmEventTopic | null {
+    if (!Array.isArray(topics) || topics.length !== 3) {
+      return null;
     }
+
+    const [module, version, kind] = topics;
+    if (
+      module !== AMM_EVENT_TOPIC_MODULE ||
+      version !== AMM_EVENT_TOPIC_VERSION ||
+      typeof kind !== 'string'
+    ) {
+      return null;
+    }
+
+    const eventKind = kind as AmmEventKind;
+    if (!['swap', 'add_liquidity', 'remove_liquidity'].includes(eventKind)) {
+      return null;
+    }
+
+    return {
+      module: AMM_EVENT_TOPIC_MODULE,
+      version: AMM_EVENT_TOPIC_VERSION,
+      kind: eventKind,
+    };
+  }
+
+  public decodeAmmEvent(rawEvent: unknown): AmmEventDecodeResult | null {
+    if (!rawEvent || typeof rawEvent !== 'object') {
+      return null;
+    }
+
+    const event = rawEvent as { topics?: unknown; data?: unknown };
+    const topic = this.parseAmmEventTopic(event.topics);
+    if (!topic) {
+      return null;
+    }
+
+    if (!event.data || typeof event.data !== 'object') {
+      return null;
+    }
+
+    const data = event.data as unknown as AmmEventV1;
+    if (data.schema_version !== 1 || data.event !== topic.kind) {
+      return null;
+    }
+
+    return {
+      topic,
+      data,
+    };
+  }
+
+  public extractAmmEventsFromTransactionResult(txResult: any): AmmEventDecodeResult[] {
+    if (!txResult || !Array.isArray(txResult.events)) {
+      return [];
+    }
+
+    return txResult.events
+      .map((event: unknown): AmmEventDecodeResult | null => this.decodeAmmEvent(event))
+      .filter(
+        (decoded: AmmEventDecodeResult | null): decoded is AmmEventDecodeResult =>
+          decoded !== null
+      );
   }
 
   async healthCheck(): Promise<{ horizon: boolean; sorobanRpc: boolean }> {
@@ -347,5 +379,61 @@ export class StellarService {
     (results as any).sorobanBreaker = this.sorobanBreaker.getMetrics();
 
     return results;
+  }
+
+  /**
+   * Ping the soroban RPC and attempt a lightweight contract invocation
+   * to verify contract reachability. Returns rpc, contract and ledger info.
+   */
+  async pingContract(): Promise<{ rpc: boolean; contract: boolean; ledger: number | null }> {
+    const status = { rpc: false, contract: false, ledger: null as number | null };
+
+    // Check RPC health
+    try {
+      await this.sorobanServer.getHealth();
+      status.rpc = true;
+    } catch (error) {
+      logger.error('Soroban RPC health check failed (pingContract):', error);
+      // If RPC is down we cannot proceed to contract check
+      return status;
+    }
+
+    // Try to fetch latest ledger from Horizon for diagnostic info
+    try {
+      const resp = await axios.get(`${this.horizonUrl}/ledgers?order=desc&limit=1`);
+      const latest = resp.data?._embedded?.records?.[0];
+      if (latest && latest.sequence) {
+        status.ledger = Number(latest.sequence);
+      }
+    } catch (error) {
+      logger.warn('Failed to fetch latest ledger for health check:', error);
+    }
+
+    // Attempt a lightweight contract invocation via prepareTransaction.
+    // This will exercise the Soroban RPC path for invoking the named
+    // function and will fail if the contract or RPC cannot be reached.
+    try {
+      const tempKey = Keypair.random().publicKey();
+      const account = new Account(tempKey, '1');
+      const contract = new Contract(this.contractId);
+      const operation = contract.call('get_admin');
+
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(operation)
+        .setTimeout(10)
+        .build();
+
+      // prepareTransaction will call out to the soroban RPC; success implies
+      // the contract is reachable and callable (at least for read-only).
+      await this.sorobanServer.prepareTransaction(tx);
+      status.contract = true;
+    } catch (error) {
+      logger.error('Contract ping failed (pingContract):', error);
+    }
+
+    return status;
   }
 }

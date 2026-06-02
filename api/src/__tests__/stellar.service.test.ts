@@ -177,4 +177,89 @@ describe('StellarService', () => {
       expect(result).toBe('prepared_tx_xdr');
     });
   });
+
+  describe('AMM event decoding', () => {
+    it('should parse a valid AMM topic tuple', () => {
+      const topic = service.parseAmmEventTopic(['amm', 'v1', 'swap']);
+
+      expect(topic).toEqual({
+        module: 'amm',
+        version: 'v1',
+        kind: 'swap',
+      });
+    });
+
+    it('should decode an AMM swap event', () => {
+      const event = {
+        topics: ['amm', 'v1', 'swap'],
+        data: {
+          schema_version: 1,
+          event: 'swap',
+          user: 'GUSERADDRESS',
+          pool: 'PPOOLADDRESS',
+          asset_in: 'GASSETIN',
+          amount_in: '1000',
+          asset_out: 'GASSETOUT',
+          amount_out: '950',
+          timestamp: 1700000000,
+        },
+      };
+
+      const decoded = service.decodeAmmEvent(event);
+
+      expect(decoded).toEqual({
+        topic: {
+          module: 'amm',
+          version: 'v1',
+          kind: 'swap',
+        },
+        data: event.data,
+      });
+    });
+
+    it('should return null for non-AMM events', () => {
+      const event = {
+        topics: ['timelock', 'queue'],
+        data: {
+          foo: 'bar',
+        },
+      };
+
+      expect(service.decodeAmmEvent(event)).toBeNull();
+    });
+
+    it('should extract only AMM events from a transaction result', () => {
+      const txResult = {
+        events: [
+          {
+            topics: ['amm', 'v1', 'add_liquidity'],
+            data: {
+              schema_version: 1,
+              event: 'add_liquidity',
+              user: 'GUSERADDRESS',
+              pool: 'PPOOLADDRESS',
+              asset_a: 'GASSETA',
+              amount_a: '500',
+              asset_b: 'GASSETB',
+              amount_b: '1000',
+              shares_minted: '1500',
+              timestamp: 1700000001,
+            },
+          },
+          {
+            topics: ['not', 'an', 'amm'],
+            data: {
+              schema_version: 1,
+              event: 'foo',
+            },
+          },
+        ],
+      };
+
+      const events = service.extractAmmEventsFromTransactionResult(txResult);
+
+      expect(events).toHaveLength(1);
+      expect(events[0]?.topic.kind).toBe('add_liquidity');
+    });
+  });
 });
