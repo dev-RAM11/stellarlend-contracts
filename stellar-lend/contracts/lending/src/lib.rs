@@ -535,6 +535,10 @@ impl LendingContract {
         }
     }
 
+}
+
+// Close the `impl LendingContract` block above. Helper functions below are
+// free functions and must not be declared inside the `impl`.
 fn release_reentrancy_lock(env: &Env) {
     let reentrancy_lock_key = Symbol::new(env, "reent_l");
     env.storage().temporary().remove(&reentrancy_lock_key);
@@ -616,7 +620,7 @@ mod test {
         li.sequence_number = li.sequence_number.saturating_add(seconds as u32);
         env.ledger().set(li);
     }
-}
+
     #[test]
     fn test_initialize_and_get_admin() {
         let (_env, client, admin, _user) = setup();
