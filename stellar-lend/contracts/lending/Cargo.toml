@@ -16,5 +16,6 @@ soroban-sdk = { workspace = true }
 soroban-sdk = { workspace = true, features = ["testutils"] }
 proptest = "1.5"
 
+# Re-export modules for integration tests
 [features]
 testutils = ["soroban-sdk/testutils"]

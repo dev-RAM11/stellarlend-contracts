@@ -57,3 +57,83 @@ This note documents numeric assumptions for long-horizon interest accrual and th
   - Saturation in `lending`
   - Explicit error in `hello-world`
 - This prevents silent wraparound and protects debt/accounting invariants under adversarial time jumps and parameter settings.
+
+
+# Interest Numeric Assumptions
+
+## Precision and Scale
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| **Decimal places** | 7 | Stellar native asset precision |
+| **Internal scale** | 10^7 | All amounts stored as i128 * 10^7 |
+| **Rate precision** | Basis points (1/10000) | Fine-grained rate control |
+| **Interest scale** | 10^9 | Intermediate calculation precision |
+
+## Rounding Strategy
+
+StellarLend uses **Half-Up rounding** for interest accrual:
+
+```rust
+// From rounding_strategy.rs
+pub fn compute_compound_interest(
+    env: &Env,
+    principal: i128,
+    rate_bps: i128,
+    periods: u32,
+    mode: RoundingMode,
+) -&gt; i128 {
+    // interest = principal * rate_bps * periods / 10000
+    // Rounded according to mode
+}
+
+| Rounding Mode | Behavior          | Use Case                          |
+| ------------- | ----------------- | --------------------------------- |
+| `HalfUp`      | 0.5 rounds up     | Default interest accrual          |
+| `Down`        | Always round down | Conservative liquidation          |
+| `Up`          | Always round up   | Fee calculation (favors protocol) |
+
+
+Drift Bounds
+| Scenario                    | Max Acceptable Drift | Test                                       |
+| --------------------------- | -------------------- | ------------------------------------------ |
+| Daily accrual, 1 year       | 1 bps (0.01%)        | `test_daily_accrual_drift_over_one_year`   |
+| Hourly vs Daily convergence | 1 bps                | `test_hourly_vs_daily_accrual_convergence` |
+| Small principal, high rate  | No negative drift    | `test_small_principal_high_rate_drift`     |
+| Zero rate                   | Zero drift           | `test_zero_rate_no_drift`                  |
+| Rounding mode divergence    | ≤ periods \* 1 unit  | `test_rounding_mode_divergence_bound`      |
+
+
+Regression Gate
+The interest_drift_regression_test.rs integration test is a mandatory CI gate:
+# Run the drift regression test
+cargo test --test interest_drift_regression_test
+
+# Run all lending tests
+cargo test -p stellar-lend-contract
+
+
+If this test fails, the PR cannot merge. It guards against:
+Floating-point precision changes
+Rounding strategy modifications
+Rate model parameter changes that affect compounding
+Compiler optimization changes affecting numeric stability
+
+
+Interest Rate Model
+borrow_rate = base_rate + (utilization * multiplier / SCALE)
+            + (if utilization > kink then (utilization - kink) * jump_multiplier / SCALE else 0)
+
+supply_rate = borrow_rate * utilization * (1 - reserve_factor) / SCALE
+Where:
+utilization = total_borrows / total_deposits
+SCALE = 10_000 (basis points scale)
+All intermediate values use i128 to prevent overflow
+
+
+
+Known Limitations
+Daily compounding approximation: We use 365-day year, not exact calendar days
+Rate granularity: 1 bps minimum rate change (0.01%)
+Small principal rounding: Sub-1-unit interest rounds to 0 (dust)
+
