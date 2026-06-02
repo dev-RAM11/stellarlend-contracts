@@ -11,10 +11,12 @@ path = "src/lib.rs"
 
 [dependencies]
 soroban-sdk = { workspace = true }
+stellar-lend-common = { path = "../common" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
-proptest = "1.5"
+proptest = { workspace = true }
 
+# Re-export modules for integration tests
 [features]
 testutils = ["soroban-sdk/testutils"]

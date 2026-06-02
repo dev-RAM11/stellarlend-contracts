@@ -109,6 +109,14 @@ export const withdraw = async (req: Request, res: Response, next: NextFunction) 
   }
 };
 
+export const processHook = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    return res.status(200).json({ success: true, message: 'Hook authenticated' });
+  } catch (error) {
+    next(error);
+  }
+};
+
 export const healthCheck = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const services = await stellarService.healthCheck();
@@ -118,6 +126,22 @@ export const healthCheck = async (req: Request, res: Response, next: NextFunctio
       status: isHealthy ? 'healthy' : 'unhealthy',
       timestamp: new Date().toISOString(),
       services,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const deepHealthCheck = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const result = await stellarService.pingContract();
+    const isHealthy = result.rpc && result.contract;
+
+    res.status(isHealthy ? 200 : 503).json({
+      rpc: result.rpc,
+      contract: result.contract,
+      ledger: result.ledger,
+      timestamp: new Date().toISOString(),
     });
   } catch (error) {
     next(error);

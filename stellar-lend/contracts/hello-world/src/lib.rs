@@ -26,7 +26,10 @@ pub struct HelloContract;
 
 #[contractimpl]
 impl HelloContract {
-    /// Set the admin (one-time).
+    /// Set or rotate the admin.
+    ///
+    /// - If no admin exists yet, this bootstraps the contract.
+    /// - If an admin already exists, the current admin must authorize the change.
     pub fn set_admin(env: Env, admin: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
     }
@@ -101,7 +104,7 @@ impl HelloContract {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, MockAuth, MockAuthInvoke};
     use soroban_sdk::Symbol;
 
     fn setup() -> (Env, HelloContractClient<'static>, Address, Address) {

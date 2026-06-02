@@ -16,7 +16,16 @@ import axios from 'axios';
 import { config } from '../config';
 import logger from '../utils/logger';
 import { InternalServerError } from '../utils/errors';
-import { TransactionResponse, TransactionStatus } from '../types';
+import {
+  TransactionResponse,
+  TransactionStatus,
+  AmmEventDecodeResult,
+  AmmEventKind,
+  AmmEventTopic,
+  AmmEventV1,
+  AMM_EVENT_TOPIC_MODULE,
+  AMM_EVENT_TOPIC_VERSION,
+} from '../types';
 
 export class StellarService {
   private horizonUrl: string;
@@ -24,6 +33,7 @@ export class StellarService {
   private networkPassphrase: string;
   private contractId: string;
   private sorobanServer: SorobanServer;
+  private sorobanBreaker: CircuitBreaker;
 
   constructor() {
     this.horizonUrl = config.stellar.horizonUrl;
@@ -31,6 +41,13 @@ export class StellarService {
     this.networkPassphrase = config.stellar.networkPassphrase;
     this.contractId = config.stellar.contractId;
     this.sorobanServer = new SorobanServer(this.sorobanRpcUrl);
+    this.sorobanBreaker = new CircuitBreaker({
+      windowMs: config.circuitBreaker.windowMs,
+      failureThreshold: config.circuitBreaker.failureThreshold,
+      minRequests: config.circuitBreaker.minRequests,
+      openMs: config.circuitBreaker.openMs,
+      halfOpenMaxTrial: config.circuitBreaker.halfOpenMaxTrial,
+    });
   }
 
   async getAccount(address: string): Promise<Account> {
@@ -93,7 +110,9 @@ export class StellarService {
         .setTimeout(30)
         .build();
 
-      const preparedTx = await this.sorobanServer.prepareTransaction(transaction);
+      const preparedTx = await this.sorobanBreaker.exec(() =>
+        this.sorobanServer.prepareTransaction(transaction)
+      );
       preparedTx.sign(sourceKeypair);
 
       return preparedTx.toXDR();
@@ -131,7 +150,9 @@ export class StellarService {
         .setTimeout(30)
         .build();
 
-      const preparedTx = await this.sorobanServer.prepareTransaction(transaction);
+      const preparedTx = await this.sorobanBreaker.exec(() =>
+        this.sorobanServer.prepareTransaction(transaction)
+      );
       preparedTx.sign(sourceKeypair);
 
       return preparedTx.toXDR();
@@ -169,7 +190,9 @@ export class StellarService {
         .setTimeout(30)
         .build();
 
-      const preparedTx = await this.sorobanServer.prepareTransaction(transaction);
+      const preparedTx = await this.sorobanBreaker.exec(() =>
+        this.sorobanServer.prepareTransaction(transaction)
+      );
       preparedTx.sign(sourceKeypair);
 
       return preparedTx.toXDR();
@@ -207,7 +230,9 @@ export class StellarService {
         .setTimeout(30)
         .build();
 
-      const preparedTx = await this.sorobanServer.prepareTransaction(transaction);
+      const preparedTx = await this.sorobanBreaker.exec(() =>
+        this.sorobanServer.prepareTransaction(transaction)
+      );
       preparedTx.sign(sourceKeypair);
 
       return preparedTx.toXDR();
@@ -259,6 +284,71 @@ export class StellarService {
     };
   }
 
+  public parseAmmEventTopic(topics: unknown): AmmEventTopic | null {
+    if (!Array.isArray(topics) || topics.length !== 3) {
+      return null;
+    }
+
+    const [module, version, kind] = topics;
+    if (
+      module !== AMM_EVENT_TOPIC_MODULE ||
+      version !== AMM_EVENT_TOPIC_VERSION ||
+      typeof kind !== 'string'
+    ) {
+      return null;
+    }
+
+    const eventKind = kind as AmmEventKind;
+    if (!['swap', 'add_liquidity', 'remove_liquidity'].includes(eventKind)) {
+      return null;
+    }
+
+    return {
+      module: AMM_EVENT_TOPIC_MODULE,
+      version: AMM_EVENT_TOPIC_VERSION,
+      kind: eventKind,
+    };
+  }
+
+  public decodeAmmEvent(rawEvent: unknown): AmmEventDecodeResult | null {
+    if (!rawEvent || typeof rawEvent !== 'object') {
+      return null;
+    }
+
+    const event = rawEvent as { topics?: unknown; data?: unknown };
+    const topic = this.parseAmmEventTopic(event.topics);
+    if (!topic) {
+      return null;
+    }
+
+    if (!event.data || typeof event.data !== 'object') {
+      return null;
+    }
+
+    const data = event.data as unknown as AmmEventV1;
+    if (data.schema_version !== 1 || data.event !== topic.kind) {
+      return null;
+    }
+
+    return {
+      topic,
+      data,
+    };
+  }
+
+  public extractAmmEventsFromTransactionResult(txResult: any): AmmEventDecodeResult[] {
+    if (!txResult || !Array.isArray(txResult.events)) {
+      return [];
+    }
+
+    return txResult.events
+      .map((event: unknown): AmmEventDecodeResult | null => this.decodeAmmEvent(event))
+      .filter(
+        (decoded: AmmEventDecodeResult | null): decoded is AmmEventDecodeResult =>
+          decoded !== null
+      );
+  }
+
   async healthCheck(): Promise<{ horizon: boolean; sorobanRpc: boolean }> {
     const results = {
       horizon: false,
@@ -273,12 +363,77 @@ export class StellarService {
     }
 
     try {
-      await this.sorobanServer.getHealth();
-      results.sorobanRpc = true;
+      // If circuit is open, treat soroban RPC as unhealthy immediately
+      const breakerState = this.sorobanBreaker.getState();
+      if (breakerState === 'OPEN') {
+        results.sorobanRpc = false;
+      } else {
+        await this.sorobanBreaker.exec(() => this.sorobanServer.getHealth());
+        results.sorobanRpc = true;
+      }
     } catch (error) {
       logger.error('Soroban RPC health check failed:', error);
     }
 
+    // attach breaker metrics for observability
+    (results as any).sorobanBreaker = this.sorobanBreaker.getMetrics();
+
     return results;
+  }
+
+  /**
+   * Ping the soroban RPC and attempt a lightweight contract invocation
+   * to verify contract reachability. Returns rpc, contract and ledger info.
+   */
+  async pingContract(): Promise<{ rpc: boolean; contract: boolean; ledger: number | null }> {
+    const status = { rpc: false, contract: false, ledger: null as number | null };
+
+    // Check RPC health
+    try {
+      await this.sorobanServer.getHealth();
+      status.rpc = true;
+    } catch (error) {
+      logger.error('Soroban RPC health check failed (pingContract):', error);
+      // If RPC is down we cannot proceed to contract check
+      return status;
+    }
+
+    // Try to fetch latest ledger from Horizon for diagnostic info
+    try {
+      const resp = await axios.get(`${this.horizonUrl}/ledgers?order=desc&limit=1`);
+      const latest = resp.data?._embedded?.records?.[0];
+      if (latest && latest.sequence) {
+        status.ledger = Number(latest.sequence);
+      }
+    } catch (error) {
+      logger.warn('Failed to fetch latest ledger for health check:', error);
+    }
+
+    // Attempt a lightweight contract invocation via prepareTransaction.
+    // This will exercise the Soroban RPC path for invoking the named
+    // function and will fail if the contract or RPC cannot be reached.
+    try {
+      const tempKey = Keypair.random().publicKey();
+      const account = new Account(tempKey, '1');
+      const contract = new Contract(this.contractId);
+      const operation = contract.call('get_admin');
+
+      const tx = new TransactionBuilder(account, {
+        fee: BASE_FEE,
+        networkPassphrase: this.networkPassphrase,
+      })
+        .addOperation(operation)
+        .setTimeout(10)
+        .build();
+
+      // prepareTransaction will call out to the soroban RPC; success implies
+      // the contract is reachable and callable (at least for read-only).
+      await this.sorobanServer.prepareTransaction(tx);
+      status.contract = true;
+    } catch (error) {
+      logger.error('Contract ping failed (pingContract):', error);
+    }
+
+    return status;
   }
 }

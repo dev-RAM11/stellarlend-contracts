@@ -133,8 +133,8 @@ export ADMIN_SECRET_KEY="S..."   # deployer secret key – never commit this
 # Build first, then deploy
 ./scripts/deploy.sh --network testnet --build
 
-# Mainnet
-./scripts/deploy.sh --network mainnet
+# Mainnet (requires MAINNET_CONFIRM=YES_I_AM_SURE environment variable)
+MAINNET_CONFIRM=YES_I_AM_SURE ./scripts/deploy.sh --network mainnet
 ```
 
 The script writes the contract IDs to `scripts/deployed/<network>/`:
@@ -143,6 +143,32 @@ The script writes the contract IDs to `scripts/deployed/<network>/`:
 scripts/deployed/testnet/lending_contract_id.txt
 scripts/deployed/testnet/amm_contract_id.txt
 ```
+
+### WASM checksum verification
+
+The deploy script now performs an integrity check on the optimized WASM
+artifacts before uploading them. It computes a SHA-256 checksum for each
+artifact and compares it against a baseline stored at
+`scripts/deployed/<network>/checksums.txt`.
+
+- Default behavior: the script refuses to deploy if the baseline is missing or
+  if any artifact's checksum differs from the baseline.
+- To seed or rotate the baseline deliberately, run the deploy script with
+  `--update-checksum` (explicit opt-in). This computes new checksums and
+  writes `scripts/deployed/<network>/checksums.txt`.
+- Use `--dry-run` to exercise the build + checksum logic without performing
+  any network uploads.
+
+Rotation workflow (recommended):
+
+1. Run a reproducible build: `./scripts/build.sh --release`.
+2. Verify artifacts locally and inspect sizes/interfaces.
+3. Seed the baseline: `./scripts/deploy.sh --network testnet --dry-run --update-checksum`.
+4. Commit `scripts/deployed/<network>/checksums.txt` to the repo (protected branch).
+5. For future builds, run `./scripts/deploy.sh --network testnet` and the
+   script will refuse to deploy on unexpected checksum changes unless you
+   intentionally rotate with `--update-checksum`.
+
 
 ### Manual deploy (step-by-step)
 
@@ -349,11 +375,13 @@ Before deploying to mainnet:
 - [ ] Oracle price feeds configured via `update_price_feed`
 - [ ] Emergency pause tested: `set_emergency_pause(admin, true)` → confirmed paused
 - [ ] Emergency pause disabled before launch: `set_emergency_pause(admin, false)`
+- [ ] `MAINNET_CONFIRM=YES_I_AM_SURE` environment variable provided to bypass the safety guard preventing accidental mainnet deployments
 
 ```bash
 # Mainnet deploy + init
 export ADMIN_SECRET_KEY="S..."          # from secure store
 export ADMIN_ADDRESS="G..."             # multisig / hardware wallet
+export MAINNET_CONFIRM="YES_I_AM_SURE"  # explicit confirmation guard
 
 ./scripts/deploy.sh --network mainnet --build
 export LENDING_CONTRACT_ID="$(cat scripts/deployed/mainnet/lending_contract_id.txt)"
