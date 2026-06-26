@@ -147,3 +147,29 @@ The `debt.rs` module (interest accrual, principal mutations) follows the same ch
 - **Debt Module**: [debt.rs](./src/debt.rs) - Interest accrual with checked arithmetic
 - **Rounding Strategy**: [rounding_strategy.rs](./src/rounding_strategy.rs) - Pattern for checked operations
 
+
+## Liquidation Invariant: Checked Subtraction
+
+`liquidate` computes `new_debt = debt - actual_repay` and
+`new_col = collateral - final_seized`.
+
+Both operations use `checked_sub` returning `LendingError::Overflow` on
+underflow. This turns a silent `saturating_sub` floor-to-zero into a loud
+failure, surfacing any logic bug where the close-factor or seizure clamp is
+incorrect.
+
+### Why underflow is unreachable on valid inputs
+
+| Variable | Clamp that prevents underflow |
+|---|---|
+| `actual_repay` | Clamped to `min(amount, debt * CLOSE_FACTOR / 10000)` ≤ `debt` |
+| `final_seized` | Clamped to `min(seized_collateral, collateral)` ≤ `collateral` |
+
+### Why checked_sub is still necessary
+
+If the clamp arithmetic is ever changed incorrectly, `saturating_sub` would
+silently write `0` to debt or collateral, masking the bug. `checked_sub`
+causes the transaction to revert with `LendingError::Overflow`, making the
+violation observable in tests and on-chain.
+
+**Test coverage:** `src/liquidate_checked_sub_test.rs`

@@ -23,6 +23,8 @@ mod interest_drift_regression_test;
 mod rounding_drift_test;
 #[cfg(test)]
 mod oracle_payload_binding_test;
+#[cfg(test)]
+mod liquidate_checked_sub_test;
 
 use debt::{
     borrow_amount, effective_debt, load_debt, repay_amount, save_debt, settle_accrual,
@@ -566,8 +568,16 @@ impl LendingContract {
             seized_collateral
         };
 
-        let new_debt = debt.saturating_sub(actual_repay);
-        let new_col = collateral.saturating_sub(final_seized);
+        // Invariant: close-factor clamp guarantees actual_repay <= debt,
+        // and the seizure clamp guarantees final_seized <= collateral.
+        // checked_sub surfaces any violation loudly instead of silently
+        // flooring to zero (which would mask an accounting bug).
+        let new_debt = debt
+            .checked_sub(actual_repay)
+            .ok_or(LendingError::Overflow)?;
+        let new_col = collateral
+            .checked_sub(final_seized)
+            .ok_or(LendingError::Overflow)?;
 
         let updated_position = DebtPosition {
             principal: new_debt,
