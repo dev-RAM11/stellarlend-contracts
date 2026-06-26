@@ -71,6 +71,8 @@ mod bad_debt_ledger_test;
 mod supply_rate_split_test;
 #[cfg(test)]
 mod repay_debt_floor_test;
+#[cfg(test)]
+mod liquidate_perf_test;
 
 use debt::{
     borrow_amount, cached_borrow_rate, effective_debt, load_debt, repay_amount, save_debt,
@@ -1008,6 +1010,23 @@ impl LendingContract {
     ///
     /// All three use [`math::checked_mul_div_floor`] so every truncation
     /// transfers the sub-unit remainder to the protocol / remaining borrowers.
+    /// # Storage read budget
+    ///
+    /// This function is expected to perform at most **7** storage reads on the hot path:
+    /// 1. Flash active flag (instance storage)
+    /// 2. Collateral amount (persistent storage)
+    /// 3. Debt position (persistent storage via `load_debt`)
+    /// 4. Bad debt (persistent storage, only when shortfall occurs)
+    /// 5. Optional oracle price reads (instance storage) – enforced by `require_fresh_valuation_prices`
+    /// 6. Parameter lookups (instance storage) – if any future extensions add them.
+    /// 7. Additional reads for temporary storage used internally.
+    ///
+    /// The implementation aims to batch redundant reads where possible and avoids
+    /// re‑loading the same entry multiple times.
+    ///
+    /// The per‑call read budget is enforced by a regression test in
+    /// `liquidate_perf_test.rs`.
+    ///
     pub fn liquidate(
         env: Env,
         liquidator: Address,

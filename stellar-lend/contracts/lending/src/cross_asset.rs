@@ -138,6 +138,8 @@ fn extend_debt_asset_ttl(env: &Env, user: &Address, asset: &Address) {
     }
 }
 
+/// Computes the aggregate health factor across all collateral and debt assets.
+/// See `cross_asset.md` for the full aggregation pipeline and a worked example.
 pub fn compute_aggregate_health_factor(env: &Env, user: &Address) -> Result<i128, LendingError> {
     let collateral_assets = get_user_collateral_assets(env, user);
     let debt_assets = get_user_debt_assets(env, user);
