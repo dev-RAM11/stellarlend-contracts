@@ -26,6 +26,8 @@ mod emergency_state_matrix_test;
 #[cfg(test)]
 mod error_codes_test;
 #[cfg(test)]
+mod flash_pause_gating_test;
+#[cfg(test)]
 mod granular_pause_ops_test;
 #[cfg(test)]
 mod health_factor_edge_test;
@@ -127,6 +129,7 @@ pub enum PauseType {
     Borrow,
     Repay,
     Liquidation,
+    FlashLoan,
 }
 
 #[contracttype]
@@ -142,6 +145,7 @@ pub enum ProtocolAction {
     Borrow,
     Repay,
     Liquidate,
+    FlashLoan,
 }
 
 #[contracterror]
@@ -751,7 +755,12 @@ impl LendingContract {
 
     /// Repay function used by receiver during callback to return funds to the contract.
     /// Uses checked arithmetic to prevent overflow/underflow.
+    ///
+    /// Gated behind pause and emergency checks to prevent any flash-loan
+    /// interaction during a protocol pause or emergency shutdown.
     pub fn repay_flash_loan(env: Env, payer: Address, asset: Address, amount: i128) {
+        check_pause_status(&env, ProtocolAction::FlashLoan);
+        check_emergency_status(&env, ProtocolAction::FlashLoan);
         payer.require_auth();
         let payer_key = DataKey::Balance(asset.clone(), payer.clone());
         let payer_bal: i128 = env.storage().persistent().get(&payer_key).unwrap_or(0);
@@ -771,6 +780,11 @@ impl LendingContract {
         env.storage().persistent().set(&tre_key, &new_tre_bal);
     }
 
+    /// Issue a callback-based flash loan.
+    ///
+    /// Gated behind pause and emergency checks so that flash loans
+    /// are blocked during granular pause, global pause, and emergency
+    /// shutdown/recovery — just like deposit/borrow/repay/withdraw.
     pub fn flash_loan(
         env: Env,
         initiator: Address,
@@ -779,6 +793,9 @@ impl LendingContract {
         amount: i128,
         params: Bytes,
     ) {
+        check_pause_status(&env, ProtocolAction::FlashLoan);
+        check_emergency_status(&env, ProtocolAction::FlashLoan);
+
         let tre_key = DataKey::Treasury(asset.clone());
         let tre_bal: i128 = env.storage().persistent().get(&tre_key).unwrap_or(0);
         if amount > tre_bal {
@@ -1237,6 +1254,7 @@ fn check_pause_status(env: &Env, action: ProtocolAction) {
         ProtocolAction::Borrow => PauseType::Borrow,
         ProtocolAction::Repay => PauseType::Repay,
         ProtocolAction::Liquidate => PauseType::Liquidation,
+        ProtocolAction::FlashLoan => PauseType::FlashLoan,
     };
     if pause_is_active(env, operation) {
         panic!("OperationPaused");

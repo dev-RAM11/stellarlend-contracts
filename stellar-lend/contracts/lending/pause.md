@@ -39,6 +39,7 @@ situations or maintenance windows.
 | `Repay`       | Prevents loan repayments (use with caution).                        |
 | `Withdraw`    | Prevents collateral withdrawals.                                    |
 | `Liquidation` | Prevents liquidations.                                              |
+| `FlashLoan`   | Prevents flash loan issuance and repayment (`flash_loan`, `repay_flash_loan`). |
 | `ReadOnly`    | Master switch that blocks ALL state changes (user and most admin).  |
 
 ## Liquidation-Pause Policy
@@ -106,6 +107,33 @@ The protocol follows an explicit liquidation policy that balances **solvency pro
    Reason: Liquidations provide much-needed liquidity
    Recovery: Monitor system health, adjust as needed
    ```
+
+5. **Flash Loan Exploit / Reentrancy Risk**
+   ```
+   Action: Pause FlashLoan immediately (PauseType::FlashLoan)
+   Reason: Flash loans are the primary vector for price manipulation,
+           reentrancy, and governance attacks during incidents
+   Recovery: Fix vulnerability, audit, then unpause FlashLoan last
+   ```
+
+### Flash Loan Pause Policy
+
+Flash loans are high-risk operations that are frequently used as attack vectors in DeFi exploits.
+Both `flash_loan` and `repay_flash_loan` are gated behind `check_pause_status` and
+`check_emergency_status`, identical to the deposit/borrow/repay/withdraw entrypoints.
+
+| Condition                       | `flash_loan` | `repay_flash_loan` |
+| ------------------------------- | ------------ | ------------------ |
+| Normal + No pause               | ✅ ALLOWED   | ✅ ALLOWED         |
+| `PauseType::FlashLoan` active   | ❌ BLOCKED   | ❌ BLOCKED         |
+| `PauseType::All` active         | ❌ BLOCKED   | ❌ BLOCKED         |
+| `EmergencyState::Shutdown`      | ❌ BLOCKED   | ❌ BLOCKED         |
+| `EmergencyState::Recovery`      | ❌ BLOCKED   | ❌ BLOCKED         |
+| Pause expired                   | ✅ ALLOWED   | ✅ ALLOWED         |
+
+> **Design decision**: `repay_flash_loan` is also gated because during an incident
+> there should be no in-flight flash loans. If `flash_loan` is blocked, no new
+> flash loan can start, so blocking repayment is safe and provides defense in depth.
 
 ### Security Considerations
 
@@ -228,12 +256,12 @@ Core user entry points evaluate granular/global pause flags first, then emergenc
 This keeps the `All` flag and operation-specific flags available as immediate circuit breakers,
 including for `Recovery` unwind paths that would otherwise be allowed.
 
-| Emergency State | Granular Pause | High-Risk Op (e.g. `Borrow`) | Unwind Op (e.g. `Repay`) |
-| --------------- | -------------- | ---------------------------- | ------------------------ |
-| `Normal`        | `False`        | Allowed                      | Allowed                  |
-| `Shutdown`      | `False`        | **PAUSED**                   | **PAUSED**               |
-| `Recovery`      | `False`        | **PAUSED**                   | Allowed                  |
-| `Recovery`      | `True`         | **PAUSED**                   | **PAUSED**               |
+| Emergency State | Granular Pause | High-Risk Op (e.g. `Borrow`) | Unwind Op (e.g. `Repay`) | Flash Loan |
+| --------------- | -------------- | ---------------------------- | ------------------------ | ---------- |
+| `Normal`        | `False`        | Allowed                      | Allowed                  | Allowed    |
+| `Shutdown`      | `False`        | **PAUSED**                   | **PAUSED**               | **PAUSED** |
+| `Recovery`      | `False`        | **PAUSED**                   | Allowed                  | **PAUSED** |
+| `Recovery`      | `True`         | **PAUSED**                   | **PAUSED**               | **PAUSED** |
 
 ### Read-Only Mode
 
@@ -271,8 +299,9 @@ global `All` flag are inactive. Deposit, borrow, and liquidation remain blocked 
    ledger upgrades and contract updates.
 
 4. **No Bypass**: Every operation entry point in `lib.rs` and the inner module implementations
-   enforce pause and emergency checks independently (defense in depth). There is no path that
-   skips both layers.
+   enforce pause and emergency checks independently (defense in depth). This includes
+   `flash_loan` and `repay_flash_loan`, which are gated identically to
+   deposit/borrow/repay/withdraw. There is no mutating path that skips both layers.
 
 5. **Global Overrides Local**: The `All` pause flag supersedes individual unpause flags. Setting
    `Deposit = false` while `All = true` still blocks deposit operations.
