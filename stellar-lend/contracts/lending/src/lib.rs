@@ -57,6 +57,8 @@ mod self_liquidation_test;
 mod property_invariants_test;
 #[cfg(test)]
 mod liquidate_event_test;
+#[cfg(test)]
+mod bad_debt_ledger_test;
 
 use debt::{
     borrow_amount, cached_borrow_rate, effective_debt, load_debt, repay_amount, save_debt,
@@ -64,8 +66,8 @@ use debt::{
 };
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, Bytes, BytesN,
-    Env, IntoVal, Symbol, Val, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address,
+    Bytes, BytesN, Env, IntoVal, Symbol, Val, Vec,
 };
 use soroban_sdk::token::Client as TokenClient;
 
@@ -89,6 +91,7 @@ pub enum DataKey {
     Treasury(Address),
     TotalDebt,
     TotalDeposits,
+    BadDebt,
     DebtCeiling,
     DepositCap,
     BorrowRateCache(u32),
@@ -318,6 +321,11 @@ impl LendingContract {
 
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&DataKey::Admin).unwrap()
+    }
+
+    /// Returns the accumulated protocol bad debt.
+    pub fn get_bad_debt(env: Env) -> i128 {
+        env.storage().persistent().get(&DataKey::BadDebt).unwrap_or(0i128)
     }
 
     /// Set the configured oracle pubkey used to verify signed price updates.
@@ -772,8 +780,30 @@ impl LendingContract {
                 .map_err(|_| LendingError::Overflow)?;
 
         // Clamp: never seize more than the borrower's available collateral.
-        let final_seized = if seized_collateral > collateral {
-            collateral
+        // When the incentivized seizure exceeds available collateral, the
+        // shortfall is written off as protocol bad debt (with a backstop event)
+        // rather than silently lost.
+        let available_collateral = collateral;
+        let final_seized = if seized_collateral > available_collateral {
+            let shortfall = seized_collateral
+                .checked_sub(available_collateral)
+                .ok_or(LendingError::Overflow)?;
+            let current_bad_debt: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::BadDebt)
+                .unwrap_or(0i128);
+            let new_bad_debt = current_bad_debt
+                .checked_add(shortfall)
+                .ok_or(LendingError::Overflow)?;
+            env.storage()
+                .persistent()
+                .set(&DataKey::BadDebt, &new_bad_debt);
+            env.events().publish(
+                (Symbol::new(&env, "bad_debt"), borrower.clone()),
+                shortfall,
+            );
+            available_collateral
         } else {
             seized_collateral
         };
