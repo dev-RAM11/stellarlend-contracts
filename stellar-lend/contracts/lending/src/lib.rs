@@ -16,6 +16,8 @@ mod admin_setters_dedupe_test;
 #[cfg(test)]
 mod cross_asset_test;
 #[cfg(test)]
+mod bad_debt_write_off_test;
+#[cfg(test)]
 mod deposit_accounting_test;
 #[cfg(test)]
 mod deposit_cap_race_test;
@@ -128,6 +130,8 @@ pub enum DataKey {
     UserDebtAssets(Address),
     /// Per-asset total outstanding debt (cross-asset tracking).
     TotalDebtAsset(Address),
+    /// Insurance fund balance credited by governance or protocol fees (i128).
+    InsuranceFund,
 }
 
 #[contractevent]
@@ -155,6 +159,25 @@ pub struct LiquidationEventV1 {
     pub seized: i128,
     pub health_factor_before: i128,
     pub shortfall: i128,
+}
+
+/// Emitted by [`LendingContract::write_off_bad_debt`] whenever a governed
+/// write-off completes.  Fields sum to `amount`:
+///
+/// ```text
+/// amount == insurance_used + reserve_used + socialized
+/// ```
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BadDebtWrittenOffEvent {
+    /// Total amount of bad debt cleared in this call.
+    pub amount: i128,
+    /// Portion absorbed by the insurance fund.
+    pub insurance_used: i128,
+    /// Portion absorbed by the protocol reserve (TotalDeposits surplus).
+    pub reserve_used: i128,
+    /// Residual applied as a depositor haircut (index socialisation).
+    pub socialized: i128,
 }
 
 #[contracttype]
@@ -232,6 +255,10 @@ pub enum LendingError {
     ApproverNotFound = 4009,
     MaxApproversReached = 4010,
     InvalidUpgradeConfig = 4011,
+    /// `write_off_bad_debt` called when there is no recorded bad debt.
+    NoBadDebt = 6001,
+    /// `write_off_bad_debt` called with `amount` greater than recorded bad debt.
+    WriteOffExceedsBadDebt = 6002,
 }
 
 #[contracttype]
@@ -1186,6 +1213,163 @@ impl LendingContract {
             ltv_bps,
             liquidation_threshold_bps,
             debt_ceiling,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Bad-debt accounting views
+    // -----------------------------------------------------------------------
+
+    /// Return the current insurance fund balance.
+    ///
+    /// The insurance fund is credited by [`credit_insurance_fund`] and consumed
+    /// by [`write_off_bad_debt`] before the reserve or depositor pool is touched.
+    pub fn get_insurance_fund(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::InsuranceFund)
+            .unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
+    // Bad-debt accounting mutators (admin-only)
+    // -----------------------------------------------------------------------
+
+    /// Credit the insurance fund by `amount`.
+    ///
+    /// This is a **pure accounting** operation — no token transfer is performed.
+    /// The caller (governance or an authorised fee-routing contract) is
+    /// responsible for ensuring the corresponding tokens are available.
+    ///
+    /// # Errors
+    /// - [`LendingError::InvalidAmount`] if `amount <= 0`.
+    /// - [`LendingError::Overflow`] if the resulting balance would overflow i128.
+    pub fn credit_insurance_fund(env: Env, amount: i128) -> Result<(), LendingError> {
+        assert_admin(&env);
+        if amount <= 0 {
+            return Err(LendingError::InvalidAmount);
+        }
+        let current: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::InsuranceFund)
+            .unwrap_or(0);
+        let new_balance = current.checked_add(amount).ok_or(LendingError::Overflow)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::InsuranceFund, &new_balance);
+        Ok(())
+    }
+
+    /// Govern-gated entrypoint to write off recorded bad debt.
+    ///
+    /// Clears `amount` of bad debt against available backstops in strict
+    /// precedence order:
+    ///
+    /// 1. **Insurance fund** — consumed first (lowest socialisation impact).
+    /// 2. **Protocol reserve** (`TotalDeposits` surplus) — consumed next.
+    /// 3. **Depositor socialisation** — residual applied as an index haircut
+    ///    to `TotalDeposits` only when both backstops are exhausted.
+    ///
+    /// Emits [`BadDebtWrittenOffEvent`] on success, recording the exact amount
+    /// drawn from each source for auditability.
+    ///
+    /// # Checks-Effects-Interactions
+    /// All state mutations occur atomically before the event is published.
+    /// No external call is made; the function is re-entrancy-safe by design.
+    ///
+    /// # Errors
+    /// - [`LendingError::InvalidAmount`] if `amount <= 0`.
+    /// - [`LendingError::NoBadDebt`] if there is no recorded bad debt.
+    /// - [`LendingError::WriteOffExceedsBadDebt`] if `amount > bad_debt`.
+    /// - [`LendingError::Overflow`] if any intermediate subtraction would
+    ///   underflow (should never occur given correct guards, but kept for safety).
+    pub fn write_off_bad_debt(env: Env, amount: i128) -> Result<(), LendingError> {
+        // --- Auth ---
+        assert_admin(&env);
+
+        // --- Input guards ---
+        if amount <= 0 {
+            return Err(LendingError::InvalidAmount);
+        }
+        let bad_debt: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::BadDebt)
+            .unwrap_or(0);
+        if bad_debt == 0 {
+            return Err(LendingError::NoBadDebt);
+        }
+        if amount > bad_debt {
+            return Err(LendingError::WriteOffExceedsBadDebt);
+        }
+
+        // --- Load mutable state ---
+        let insurance: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::InsuranceFund)
+            .unwrap_or(0);
+        let total_deposits: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalDeposits)
+            .unwrap_or(0);
+
+        // --- Precedence 1: insurance fund ---
+        let insurance_used = amount.min(insurance);
+        let new_insurance = insurance
+            .checked_sub(insurance_used)
+            .ok_or(LendingError::Overflow)?;
+        let mut remaining = amount
+            .checked_sub(insurance_used)
+            .ok_or(LendingError::Overflow)?;
+
+        // --- Precedence 2: protocol reserve (TotalDeposits surplus) ---
+        let reserve_used = remaining.min(total_deposits);
+        let new_total_deposits = total_deposits
+            .checked_sub(reserve_used)
+            .ok_or(LendingError::Overflow)?;
+        remaining = remaining
+            .checked_sub(reserve_used)
+            .ok_or(LendingError::Overflow)?;
+
+        // --- Precedence 3: depositor socialisation (index haircut) ---
+        // `remaining` is the unabsorbed residual after both insurance and
+        // reserves have been consumed.  If the socialized amount would drive
+        // `TotalDeposits` negative, we reject with Overflow — governance must
+        // top up the backstops before calling again.
+        let socialized = remaining;
+        if socialized > new_total_deposits {
+            return Err(LendingError::Overflow);
+        }
+        let final_total_deposits = new_total_deposits
+            .checked_sub(socialized)
+            .ok_or(LendingError::Overflow)?;
+
+        // --- Update bad debt ---
+        let new_bad_debt = bad_debt.checked_sub(amount).ok_or(LendingError::Overflow)?;
+
+        // --- Effects: persist all state changes atomically ---
+        env.storage()
+            .instance()
+            .set(&DataKey::InsuranceFund, &new_insurance);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalDeposits, &final_total_deposits);
+        env.storage()
+            .persistent()
+            .set(&DataKey::BadDebt, &new_bad_debt);
+
+        // --- Emit auditable event ---
+        BadDebtWrittenOffEvent {
+            amount,
+            insurance_used,
+            reserve_used,
+            socialized,
         }
         .publish(&env);
 
