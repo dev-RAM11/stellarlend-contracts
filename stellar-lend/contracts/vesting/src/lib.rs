@@ -40,6 +40,13 @@ pub struct Grant {
 }
 
 impl Grant {
+    /// Returns the amount vested at Unix timestamp `now`.
+    ///
+    /// Before `start_seconds + cliff_seconds` the result is zero (cliff gate).
+    /// After `start_seconds + duration_seconds` the result is capped at `total`.
+    /// In between, vesting grows linearly: `(total * elapsed) / duration_seconds`.
+    ///
+    /// See `VESTING_MATH.md` for the full formula and worked example.
     pub fn vested_at(&self, now: u64) -> u128 {
         if now < self.start_seconds + self.cliff_seconds {
             return 0;
@@ -56,10 +63,17 @@ impl Grant {
         (self.total as u128 * elapsed as u128) / self.duration_seconds as u128
     }
 
+    /// Returns `released - claimed`, the amount the grantee can currently withdraw.
+    ///
+    /// `released` is the latest vested amount synced via [`sync`];
+    /// `claimed` is the cumulative amount already withdrawn.
     pub fn claimable(&self) -> u128 {
         self.released.saturating_sub(self.claimed)
     }
 
+    /// Advances the grant's `released` field to `vested_at(now)` and returns the
+    /// newly vested delta. This is called internally by [`claim`] and [`revoke`]
+    /// before any balance transfer.
     fn sync(&mut self, now: u64) -> u128 {
         let vested = self.vested_at(now);
         let newly_released = vested.saturating_sub(self.released);
@@ -67,6 +81,8 @@ impl Grant {
         newly_released
     }
 
+    /// Returns `total - released`, the unvested remainder that can be clawed back
+    /// via [`revoke`].
     fn locked(&self) -> u128 {
         self.total.saturating_sub(self.released)
     }
@@ -227,6 +243,20 @@ impl VestingContract {
     /// Revoke all active vesting schedules for `grantee`, transferring the
     /// still-locked portion to the treasury address.
     ///
+    /// Claws back unvested tokens from `grantee`'s schedules to the treasury:
+    ///
+    /// 1. Syncs all of `grantee`'s grants to `now` so that `released` reflects
+    ///    the current vested amount.
+    /// 2. For each non-revoked grant, computes `locked = total - released` and
+    ///    transfers the sum to the treasury.
+    /// 3. Resets each grant's `total` to its `released` value and sets
+    ///    `revoked = true`.
+    ///
+    /// After revoke the grantee keeps the vested portion and can still claim it;
+    /// the unvested portion is clawed back.
+    ///
+    /// See `VESTING_MATH.md` for the full formula and worked example.
+    ///
     /// # Errors
     /// - [`VestingError::Unauthorized`] — `caller` is not the admin.
     /// - [`VestingError::ContractPaused`] — the admin pause is active.
@@ -339,6 +369,12 @@ mod tests {
 
 #[cfg(test)]
 mod pause_test;
+
+#[cfg(test)]
+mod vested_at_proptest;
+
+#[cfg(test)]
+mod vesting_doc_example_test;
 
 #[cfg(test)]
 mod vesting_views_test;
