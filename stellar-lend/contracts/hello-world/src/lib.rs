@@ -49,6 +49,9 @@ mod twap_tests;
 #[cfg(test)]
 mod bridge_fee_test;
 
+#[cfg(test)]
+mod amm_integration_test;
+
 // Legacy test suite currently mismatches contract API and is excluded from CI compile.
 // #[cfg(test)]
 // mod tests;
