@@ -35,11 +35,7 @@
 
 #![cfg(test)]
 
-use soroban_sdk::{
-    contract, contractimpl,
-    testutils::Address as _,
-    Address, Bytes, Env, Symbol,
-};
+use soroban_sdk::{contract, contractimpl, testutils::Address as _, Address, Bytes, Env, Symbol};
 
 use stellarlend_lending::{DataKey, LendingContract, LendingContractClient};
 
@@ -107,10 +103,10 @@ fn setup_lending<'a>(
     env: &'a Env,
     treasury_balance: i128,
 ) -> (
-    Address,                       // lending contract id
-    LendingContractClient<'a>,     // client
-    Address,                       // asset
-    Address,                       // initiator
+    Address,                   // lending contract id
+    LendingContractClient<'a>, // client
+    Address,                   // asset
+    Address,                   // initiator
 ) {
     env.mock_all_auths();
 
@@ -534,13 +530,7 @@ fn test_compliant_receiver_fee_accounting_matches_bps() {
     // so we seed FEE extra.
     seed_balance(&env, &lending_id, &asset, &receiver_id, EXPECTED_FEE);
 
-    client.flash_loan(
-        &initiator,
-        &receiver_id,
-        &asset,
-        &AMOUNT,
-        &Bytes::new(&env),
-    );
+    client.flash_loan(&initiator, &receiver_id, &asset, &AMOUNT, &Bytes::new(&env));
 
     let treasury_after = read_treasury(&env, &lending_id, &asset);
     assert_eq!(
@@ -671,7 +661,10 @@ fn test_rollback_on_under_repayment() {
         &Bytes::new(&env),
     );
 
-    assert!(result.is_err(), "under-repaying receiver must return Err from try_flash_loan");
+    assert!(
+        result.is_err(),
+        "under-repaying receiver must return Err from try_flash_loan"
+    );
 
     // Soroban atomicity: all mutations from this invocation are rolled back.
     assert_eq!(

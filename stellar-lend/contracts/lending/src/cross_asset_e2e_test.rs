@@ -12,7 +12,7 @@
 /// - Liquidation threshold is expressed in bps (8_000 = 80%).
 /// - Minimum borrow is 1_000 (raw units) by default.
 use super::*;
-use soroban_sdk::testutils::{Address as _, LedgerInfo};
+use soroban_sdk::testutils::{Address as _, Ledger, LedgerInfo};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -69,7 +69,9 @@ fn setup() -> (
     set_price(&env, &id, &asset_col, 10_000_000);
     set_price(&env, &id, &asset_dbt, 10_000_000);
 
-    (env, client, id, admin, borrower, liquidator, asset_col, asset_dbt)
+    (
+        env, client, id, admin, borrower, liquidator, asset_col, asset_dbt,
+    )
 }
 
 /// Advance ledger time by `secs` seconds.
@@ -95,7 +97,10 @@ fn e2e_deposit_borrow_repay_withdraw_full_lifecycle() {
 
     // Deposit 10_000 units of collateral asset
     client.deposit_collateral_asset(&borrower, &asset_col, &10_000i128);
-    assert_eq!(client.get_collateral_asset_balance(&borrower, &asset_col), 10_000);
+    assert_eq!(
+        client.get_collateral_asset_balance(&borrower, &asset_col),
+        10_000
+    );
 
     // Borrow 5_000 units of debt asset (50 % of collateral at 1:1 price — well within 75 % LTV)
     client.borrow_asset(&borrower, &asset_dbt, &5_000i128);
@@ -113,7 +118,9 @@ fn e2e_deposit_borrow_repay_withdraw_full_lifecycle() {
     // Fully repay debt
     client.repay_asset(&borrower, &asset_dbt, &5_000i128);
     assert_eq!(
-        client.get_debt_asset_position(&borrower, &asset_dbt).principal,
+        client
+            .get_debt_asset_position(&borrower, &asset_dbt)
+            .principal,
         0
     );
 
@@ -122,7 +129,10 @@ fn e2e_deposit_borrow_repay_withdraw_full_lifecycle() {
 
     // Withdraw all collateral
     client.withdraw_asset(&borrower, &asset_col, &10_000i128);
-    assert_eq!(client.get_collateral_asset_balance(&borrower, &asset_col), 0);
+    assert_eq!(
+        client.get_collateral_asset_balance(&borrower, &asset_col),
+        0
+    );
 }
 
 // ── 2. Price shock drives position underwater ─────────────────────────────────
@@ -146,7 +156,10 @@ fn e2e_price_shock_collateral_crash_makes_position_liquidatable() {
     client.borrow_asset(&borrower, &asset_dbt, &7_000i128);
 
     let hf_before = client.get_cross_health_factor(&borrower);
-    assert!(hf_before >= 10_000, "expected healthy before shock, got {hf_before}");
+    assert!(
+        hf_before >= 10_000,
+        "expected healthy before shock, got {hf_before}"
+    );
 
     // Halve collateral price: $1.00 → $0.50
     set_price(&env, &id, &asset_col, 5_000_000);
@@ -207,10 +220,15 @@ fn e2e_post_liquidation_invariants_no_value_created() {
     set_price(&env, &id, &asset_col, 6_000_000); // $0.60
 
     let hf_before_liq = client.get_cross_health_factor(&borrower);
-    assert!(hf_before_liq < 10_000, "position must be underwater for this test");
+    assert!(
+        hf_before_liq < 10_000,
+        "position must be underwater for this test"
+    );
 
     let col_before = client.get_collateral_asset_balance(&borrower, &asset_col);
-    let debt_before = client.get_debt_asset_position(&borrower, &asset_dbt).principal;
+    let debt_before = client
+        .get_debt_asset_position(&borrower, &asset_dbt)
+        .principal;
 
     // Simulate a 50 % close-factor liquidation (repay half of debt)
     // incentive bonus = 10 % → seized = repaid * 110 / 100
@@ -238,7 +256,9 @@ fn e2e_post_liquidation_invariants_no_value_created() {
     });
 
     let col_after = client.get_collateral_asset_balance(&borrower, &asset_col);
-    let debt_after = client.get_debt_asset_position(&borrower, &asset_dbt).principal;
+    let debt_after = client
+        .get_debt_asset_position(&borrower, &asset_dbt)
+        .principal;
 
     // Invariant 1: seized ≤ pre-liquidation collateral (no value created)
     assert!(
@@ -314,7 +334,9 @@ fn e2e_deep_underwater_seizure_capped_at_available_collateral() {
     set_price(&env, &id, &asset_col, 1_000_000); // $0.10
 
     let col_before = client.get_collateral_asset_balance(&borrower, &asset_col);
-    let debt_before = client.get_debt_asset_position(&borrower, &asset_dbt).principal;
+    let debt_before = client
+        .get_debt_asset_position(&borrower, &asset_dbt)
+        .principal;
 
     // Full close-factor repayment (50 %)
     let repaid = debt_before / 2;
@@ -323,7 +345,10 @@ fn e2e_deep_underwater_seizure_capped_at_available_collateral() {
 
     // Protocol clamps: final seized cannot exceed available collateral
     let seized = uncapped_seizure.min(col_before);
-    assert_eq!(seized, col_before, "deep underwater: should seize all collateral");
+    assert_eq!(
+        seized, col_before,
+        "deep underwater: should seize all collateral"
+    );
 
     // Simulate the clamped liquidation
     env.as_contract(&id, || {
@@ -344,7 +369,10 @@ fn e2e_deep_underwater_seizure_capped_at_available_collateral() {
     assert_eq!(col_after, 0, "collateral should be fully seized");
     // Debt reduced but not fully cleared (only 50 % close factor)
     assert!(
-        client.get_debt_asset_position(&borrower, &asset_dbt).principal > 0,
+        client
+            .get_debt_asset_position(&borrower, &asset_dbt)
+            .principal
+            > 0,
         "partial liquidation: some debt should remain"
     );
 }
@@ -367,7 +395,9 @@ fn e2e_partial_liquidation_then_full_repay_and_withdraw() {
     assert!(hf_shock < 10_000, "should be liquidatable after shock");
 
     let col_before = client.get_collateral_asset_balance(&borrower, &asset_col);
-    let debt_before = client.get_debt_asset_position(&borrower, &asset_dbt).principal;
+    let debt_before = client
+        .get_debt_asset_position(&borrower, &asset_dbt)
+        .principal;
 
     // Partial liquidation: repay 50 % of debt (close factor)
     let repaid = debt_before / 2;
@@ -394,10 +424,14 @@ fn e2e_partial_liquidation_then_full_repay_and_withdraw() {
     );
 
     // Borrower repays remaining debt
-    let remaining_debt = client.get_debt_asset_position(&borrower, &asset_dbt).principal;
+    let remaining_debt = client
+        .get_debt_asset_position(&borrower, &asset_dbt)
+        .principal;
     client.repay_asset(&borrower, &asset_dbt, &remaining_debt);
     assert_eq!(
-        client.get_debt_asset_position(&borrower, &asset_dbt).principal,
+        client
+            .get_debt_asset_position(&borrower, &asset_dbt)
+            .principal,
         0
     );
     assert_eq!(client.get_cross_health_factor(&borrower), 100_000_000);
@@ -405,7 +439,10 @@ fn e2e_partial_liquidation_then_full_repay_and_withdraw() {
     // Borrower withdraws remaining collateral
     let remaining_col = client.get_collateral_asset_balance(&borrower, &asset_col);
     client.withdraw_asset(&borrower, &asset_col, &remaining_col);
-    assert_eq!(client.get_collateral_asset_balance(&borrower, &asset_col), 0);
+    assert_eq!(
+        client.get_collateral_asset_balance(&borrower, &asset_col),
+        0
+    );
 }
 
 // ── 7. Two-collateral one-debt cross-asset shock ───────────────────────────────

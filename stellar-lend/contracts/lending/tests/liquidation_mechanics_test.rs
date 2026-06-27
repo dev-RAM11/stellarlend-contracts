@@ -3,9 +3,9 @@
 
 #[cfg(test)]
 mod tests {
-    use stellarlend_lending::*;
-    use soroban_sdk::{Env, testutils::Address as _};
     use crate::math;
+    use soroban_sdk::{testutils::Address as _, Env};
+    use stellarlend_lending::*;
 
     // Helper to compute seized collateral based on actual repay
     fn compute_seized(actual_repay: i128) -> i128 {
@@ -23,7 +23,8 @@ mod tests {
         let requested: i128 = 6_000;
 
         // Health factor
-        let hf = math::checked_mul_div_floor(collateral, LIQUIDATION_THRESHOLD_BPS, 10_000).unwrap();
+        let hf =
+            math::checked_mul_div_floor(collateral, LIQUIDATION_THRESHOLD_BPS, 10_000).unwrap();
         assert!(hf < 10_000);
 
         // Close factor cap

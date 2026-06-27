@@ -10,9 +10,8 @@
 //!   repay, liquidate, nested flash_loan.
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype,
-    testutils::Address as _,
-    Address, Bytes, Env, IntoVal, Symbol, Val,
+    contract, contractimpl, contracttype, testutils::Address as _, Address, Bytes, Env, IntoVal,
+    Symbol, Val,
 };
 
 use stellarlend_lending::{DataKey, LendingContract, LendingContractClient};
@@ -80,11 +79,7 @@ impl DepositReentrant {
         env.invoke_contract::<Val>(
             &lending_id,
             &Symbol::new(&env, "deposit"),
-            soroban_sdk::vec![
-                &env,
-                user.into_val(&env),
-                100_i128.into_val(&env),
-            ],
+            soroban_sdk::vec![&env, user.into_val(&env), 100_i128.into_val(&env),],
         );
         true.into_val(&env)
     }
@@ -113,11 +108,7 @@ impl WithdrawReentrant {
         env.invoke_contract::<Val>(
             &lending_id,
             &Symbol::new(&env, "withdraw"),
-            soroban_sdk::vec![
-                &env,
-                user.into_val(&env),
-                100_i128.into_val(&env),
-            ],
+            soroban_sdk::vec![&env, user.into_val(&env), 100_i128.into_val(&env),],
         );
         true.into_val(&env)
     }
@@ -146,11 +137,7 @@ impl BorrowReentrant {
         env.invoke_contract::<Val>(
             &lending_id,
             &Symbol::new(&env, "borrow"),
-            soroban_sdk::vec![
-                &env,
-                user.into_val(&env),
-                100_i128.into_val(&env),
-            ],
+            soroban_sdk::vec![&env, user.into_val(&env), 100_i128.into_val(&env),],
         );
         true.into_val(&env)
     }
@@ -179,11 +166,7 @@ impl RepayReentrant {
         env.invoke_contract::<Val>(
             &lending_id,
             &Symbol::new(&env, "repay"),
-            soroban_sdk::vec![
-                &env,
-                user.into_val(&env),
-                100_i128.into_val(&env),
-            ],
+            soroban_sdk::vec![&env, user.into_val(&env), 100_i128.into_val(&env),],
         );
         true.into_val(&env)
     }
@@ -397,5 +380,8 @@ fn test_operations_resume_after_blocked_reentry() {
     // this would panic with "FlashLoanReentrancy" and try_deposit would return
     // an error whose message matches that — the important thing is the flag is
     // clear.
-    assert!(!read_flash_active(&env, &contract_id), "FlashActive must stay cleared");
+    assert!(
+        !read_flash_active(&env, &contract_id),
+        "FlashActive must stay cleared"
+    );
 }
