@@ -67,7 +67,57 @@ impl AmmContract {
         let amount_out = numerator / denominator;
 
         let new_ra = ra.checked_add(amount_in).expect("overflow");
-        let new_rb = rb.checked_sub(amount_out);
+        let new_rb = rb.checked_sub(amount_out).expect("underflow");
+        assert_k_monotonic(ra, rb, new_ra, new_rb, true);
+
+        env.storage().persistent().set(&KEY_RES_A, &new_ra);
+        env.storage().persistent().set(&KEY_RES_B, &new_rb);
+        amount_out
+    }
+
+    /// Swap from B -> A using the same Uniswap-v2 constant-product formula and
+    /// fee model as [`swap_a_for_b`], with token roles reversed.
+    ///
+    /// # Formula
+    ///
+    /// ```text
+    /// amount_in_with_fee = amount_in * (10_000 - fee_bps)
+    /// amount_out = (amount_in_with_fee * reserve_a)
+    ///            / (reserve_b * 10_000 + amount_in_with_fee)   [floor division]
+    /// ```
+    ///
+    /// After the swap `reserve_b` increases by `amount_in` and `reserve_a`
+    /// decreases by `amount_out`.  The k-monotonicity invariant
+    /// (k = reserve_a × reserve_b) is asserted via `assert_k_monotonic`.
+    ///
+    /// # Panics
+    /// - `amount_in <= 0`
+    /// - either reserve is zero (empty pool)
+    /// - any intermediate checked-arithmetic overflow
+    /// - k decreases after the swap (invariant violation)
+    pub fn swap_b_for_a(env: Env, amount_in: i128, fee_bps: i128) -> i128 {
+        if amount_in <= 0 {
+            panic!("amount must be positive");
+        }
+        let ra: i128 = env.storage().persistent().get(&KEY_RES_A).unwrap_or(0);
+        let rb: i128 = env.storage().persistent().get(&KEY_RES_B).unwrap_or(0);
+        if ra <= 0 || rb <= 0 {
+            panic!("empty pool");
+        }
+
+        // Mirror of swap_a_for_b with A and B roles swapped.
+        let fee_adj = 10_000_i128.checked_sub(fee_bps).expect("fee overflow");
+        let amount_in_with_fee = amount_in.checked_mul(fee_adj).expect("overflow");
+
+        // reserve_out is A, reserve_in is B
+        let numerator = amount_in_with_fee.checked_mul(ra).expect("overflow");
+        let denom_part = rb.checked_mul(10_000_i128).expect("overflow");
+        let denominator = denom_part.checked_add(amount_in_with_fee).expect("overflow");
+
+        let amount_out = numerator / denominator; // floor — pool never over-pays
+
+        let new_rb = rb.checked_add(amount_in).expect("overflow");
+        let new_ra = ra.checked_sub(amount_out).expect("underflow");
         assert_k_monotonic(ra, rb, new_ra, new_rb, true);
 
         env.storage().persistent().set(&KEY_RES_A, &new_ra);
@@ -152,3 +202,6 @@ mod test {
         assert!(k2 <= k1, "k should not increase on removal");
     }
 }
+
+#[cfg(test)]
+mod swap_symmetry_test;
