@@ -8,6 +8,8 @@ mod fee_accrual_test;
 #[cfg(test)]
 mod flash_swap_test;
 #[cfg(test)]
+mod fee_accrual_overflow_test;
+#[cfg(test)]
 mod mint_shares_proptest;
 #[cfg(test)]
 mod sqrt_precision_test;
@@ -70,14 +72,16 @@ const KEY_K_BEFORE: (&str, &str) = ("pool", "flash_k_before");
 //
 // `KEY_FEE_A` tracks the total protocol fees earned from swaps where
 // token A is the input (i.e. `swap_a_for_b`).  Each call increments it
-// by `amount_in * fee_bps / 10_000`.
+// by `amount_in * fee_bps / 10_000` using saturating addition so the
+// counter can never overflow and panic the pool.
 //
 // `KEY_FEE_B` tracks the total protocol fees earned from swaps where
 // token B is the input (i.e. `swap_b_for_a`).
 //
-// Both accumulators are monotonic non-decreasing and never exceed the
-// cumulative `amount_in` for their respective side because the fee
-// formula uses floor division with `fee_bps < 10_000`.
+// Both accumulators are monotonic non-decreasing (until saturation at
+// `i128::MAX`) and never exceed the cumulative `amount_in` for their
+// respective side because the fee formula uses floor division with
+// `fee_bps < 10_000`.
 const KEY_FEE_A: (&str, &str) = ("pool", "fee_a");
 const KEY_FEE_B: (&str, &str) = ("pool", "fee_b");
 
@@ -171,6 +175,12 @@ impl AmmContract {
 
     /// Swap from A -> B using Uniswap-style formula with fee (fee_bps out
     /// of 10_000).  Returns amount_out.
+    ///
+    /// # Overflow policy
+    ///
+    /// The fee accumulator (`KEY_FEE_A`) uses saturating addition. If the
+    /// counter reaches `i128::MAX` it stops incrementing but never panics.
+    /// This guarantees the swap cannot be halted by fee-accumulation overflow.
     pub fn swap_a_for_b(env: Env, amount_in: i128, fee_bps: i128) -> i128 {
         Self::assert_no_active_flash_swap(&env);
         if amount_in <= 0 {
@@ -203,7 +213,7 @@ impl AmmContract {
         assert_k_monotonic(ra, rb, new_ra, new_rb, true);
 
         let accrued_fee_a: i128 = env.storage().persistent().get(&KEY_FEE_A).unwrap_or(0);
-        let new_fee_a = accrued_fee_a.checked_add(fee).expect("fee_a overflow");
+        let new_fee_a = accrued_fee_a.saturating_add(fee);
 
         // ---- Price-impact guard ----
         // Spot price before  = rb  / ra   (units of B per A).
@@ -261,6 +271,11 @@ impl AmmContract {
     /// - either reserve is zero (empty pool)
     /// - any intermediate checked-arithmetic overflow
     /// - k decreases after the swap (invariant violation)
+    ///
+    /// # Overflow policy
+    ///
+    /// Identical to [`swap_a_for_b`]: the fee accumulator saturates at
+    /// `i128::MAX` and never panics on addition.
     pub fn swap_b_for_a(env: Env, amount_in: i128, fee_bps: i128) -> i128 {
         if amount_in <= 0 {
             panic!("amount must be positive");
@@ -291,7 +306,7 @@ impl AmmContract {
         assert_k_monotonic(ra, rb, new_ra, new_rb, true);
 
         let accrued_fee_b: i128 = env.storage().persistent().get(&KEY_FEE_B).unwrap_or(0);
-        let new_fee_b = accrued_fee_b.checked_add(fee).expect("fee_b overflow");
+        let new_fee_b = accrued_fee_b.saturating_add(fee);
 
         env.storage().persistent().set(&KEY_RES_A, &new_ra);
         env.storage().persistent().set(&KEY_RES_B, &new_rb);
@@ -462,6 +477,12 @@ impl AmmContract {
     /// Each fee is computed as `amount_in * fee_bps / 10_000` (floor
     /// division) at the time of the swap and accumulated into a
     /// monotonic, persisted counter.
+    ///
+    /// # Overflow policy
+    ///
+    /// Each counter uses saturating addition internally. Should a counter
+    /// reach `i128::MAX` it will stop incrementing; the pool remains
+    /// operational and will not panic.
     pub fn get_accrued_fees(env: Env) -> (i128, i128) {
         let fee_a: i128 = env.storage().persistent().get(&KEY_FEE_A).unwrap_or(0);
         let fee_b: i128 = env.storage().persistent().get(&KEY_FEE_B).unwrap_or(0);
