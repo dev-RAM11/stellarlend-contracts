@@ -6,6 +6,8 @@ pub mod math;
 #[cfg(test)]
 mod flash_swap_test;
 #[cfg(test)]
+mod flash_swap_atomicity_test;
+#[cfg(test)]
 mod fee_accrual_test;
 #[cfg(test)]
 mod mint_shares_proptest;
