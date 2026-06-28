@@ -91,12 +91,13 @@ impl AmmContract {
     /// follow-up `init_pool` from the same transaction.
     ///
     /// Resets both fee accumulators to zero.
-    pub fn init_pool(env: Env, a: i128, b: i128) {
-        Self::assert_no_active_flash_swap(&env);
+    pub fn init_pool(env: Env, a: i128, b: i128) -> Result<(), AmmPoolError> {
+        Self::assert_no_active_flash_swap(&env)?;
         env.storage().persistent().set(&KEY_RES_A, &a);
         env.storage().persistent().set(&KEY_RES_B, &b);
         env.storage().persistent().set(&KEY_FEE_A, &0_i128);
         env.storage().persistent().set(&KEY_FEE_B, &0_i128);
+        Ok(())
     }
 
     fn assert_no_active_flash_swap(env: &Env) -> Result<(), AmmPoolError> {
@@ -514,7 +515,7 @@ mod test {
         for &ra in reserve_sizes.iter() {
             for &rb in reserve_sizes.iter() {
                 for &amt in amounts.iter() {
-                    client.init_pool(&ra, &rb);
+                    client.init_pool(&ra, &rb).unwrap();
                     // swap with 30 bps fee
                     let _out = client.swap_a_for_b(&amt, &30);
                     let (new_ra, new_rb) = client.get_reserves();
@@ -541,7 +542,7 @@ mod test {
         let id = env.register(AmmContract, ());
         let client = AmmContractClient::new(&env, &id);
 
-        client.init_pool(&1000, &2000);
+        client.init_pool(&1000, &2000).unwrap();
         client.add_liquidity(&100, &200);
         let (ra1, rb1) = client.get_reserves();
         let k1 = ra1.checked_mul(rb1).unwrap();

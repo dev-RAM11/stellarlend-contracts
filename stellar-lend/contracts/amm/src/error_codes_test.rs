@@ -1,5 +1,5 @@
 use super::*;
-use soroban_sdk::Env;
+use soroban_sdk::{Env, Bytes};
 
 #[test]
 fn test_error_codes_stability() {
@@ -28,9 +28,25 @@ fn test_error_paths() {
     let res = client.swap_a_for_b(&100, &30);
     assert_eq!(res, Err(AmmPoolError::EmptyPool));
 
-    client.init_pool(&1000, &1000);
+    client.init_pool(&1000, &1000).unwrap();
 
     // Test InsufficientReserves in remove_liquidity
     let res = client.remove_liquidity(&2000, &2000);
     assert_eq!(res, Err(AmmPoolError::InsufficientReserves));
+
+    // Test Overflow in add_liquidity
+    client.init_pool(&i128::MAX, &1000).unwrap();
+    let res = client.add_liquidity(&1, &1);
+    assert_eq!(res, Err(AmmPoolError::Overflow));
+
+    // Test InvariantViolation in add_liquidity (using negative amount to force k decrease)
+    client.init_pool(&1000, &1000).unwrap();
+    let res = client.add_liquidity(&-1, &0);
+    assert_eq!(res, Err(AmmPoolError::InvariantViolation));
+
+    // Test ReentrantFlashSwap
+    client.init_pool(&1000, &1000).unwrap();
+    client.flash_swap_a_for_b(&100, &30, &Bytes::new());
+    let res = client.swap_a_for_b(&100, &30);
+    assert_eq!(res, Err(AmmPoolError::ReentrantFlashSwap));
 }
