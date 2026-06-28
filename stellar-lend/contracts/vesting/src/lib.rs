@@ -13,6 +13,12 @@ pub enum VestingError {
     NoSuchGrant,
     /// All grants for the grantee are already revoked.
     AlreadyRevoked,
+    /// `total` (principal) must be greater than zero.
+    ZeroPrincipal,
+    /// `duration_seconds` must be greater than zero.
+    ZeroDuration,
+    /// `cliff_seconds` must not exceed `duration_seconds`.
+    CliffExceedsDuration,
 }
 
 impl core::fmt::Display for VestingError {
@@ -24,13 +30,18 @@ impl core::fmt::Display for VestingError {
             }
             VestingError::NoSuchGrant => write!(f, "no such grant"),
             VestingError::AlreadyRevoked => write!(f, "already revoked"),
+            VestingError::ZeroPrincipal => write!(f, "grant total must be greater than zero"),
+            VestingError::ZeroDuration => write!(f, "duration_seconds must be greater than zero"),
+            VestingError::CliffExceedsDuration => {
+                write!(f, "cliff_seconds must not exceed duration_seconds")
+            }
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grant {
-    pub grantee: Address,
+    pub grantee: String,
     pub total: u128,
     pub claimed: u128,
     pub released: u128,
@@ -100,23 +111,6 @@ pub struct VestingContract {
     paused: bool,
 }
 
-const PERSISTENT_TTL_LEDGERS: u32 = 1_000_000;
-
-fn extend_grant_ttl(env: &Env, grantee: &Address) {
-    let key = DataKey::Grant(grantee.clone());
-    let extend_to = env.storage().max_ttl().min(PERSISTENT_TTL_LEDGERS);
-    let threshold = extend_to / 2 + 1;
-    if env.storage().persistent().has(&key) {
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, threshold, extend_to);
-    }
-}
-
-#[contract]
-pub struct VestingContract;
-
-#[contractimpl]
 impl VestingContract {
     pub fn new(admin: &str, treasury: &str) -> Self {
         Self {
@@ -184,19 +178,34 @@ impl VestingContract {
     // ── Grant management ──────────────────────────────────────────────────────
 
     /// Adds a vesting schedule for `grantee` and increases the aggregate locked supply.
+    ///
+    /// Validation runs before any state is mutated, so an invalid grant is never persisted.
+    ///
+    /// # Errors
+    /// - [`VestingError::Unauthorized`] — `caller` is not the admin.
+    /// - [`VestingError::ZeroPrincipal`] — `total` is zero.
+    /// - [`VestingError::ZeroDuration`] — `duration_seconds` is zero.
+    /// - [`VestingError::CliffExceedsDuration`] — `cliff_seconds > duration_seconds`.
     pub fn add_grant(
-        env: Env,
-        grantee: Address,
+        &mut self,
+        caller: &str,
+        grantee: &str,
         total: u128,
         start_seconds: u64,
         duration_seconds: u64,
         cliff_seconds: u64,
     ) -> Result<(), VestingError> {
-        let admin = Self::get_admin(env.clone())?;
-        admin.require_auth();
-
+        if caller != self.admin {
+            return Err(VestingError::Unauthorized);
+        }
         if total == 0 {
-            return Err(VestingError::InvalidParameters);
+            return Err(VestingError::ZeroPrincipal);
+        }
+        if duration_seconds == 0 {
+            return Err(VestingError::ZeroDuration);
+        }
+        if cliff_seconds > duration_seconds {
+            return Err(VestingError::CliffExceedsDuration);
         }
 
         let token = Self::get_token(env.clone())?;
@@ -206,7 +215,7 @@ impl VestingContract {
         token_client.transfer(&admin, &env.current_contract_address(), &(total as i128));
 
         let grant = Grant {
-            grantee: grantee.clone(),
+            grantee: grantee.to_string(),
             total,
             claimed: 0,
             released: 0,
@@ -215,10 +224,11 @@ impl VestingContract {
             cliff_seconds,
             revoked: false,
         };
-        self.grants.entry(grantee.to_string()).or_default().push(g);
+        self.grants.entry(grantee.to_string()).or_default().push(grant);
         let bal = self.balances.entry("contract".to_string()).or_default();
         *bal += total;
         self.total_locked += total;
+        Ok(())
     }
 
     fn sync_grants(&mut self, grantee: &str, now: u64) {
@@ -358,7 +368,7 @@ mod tests {
     #[test]
     fn claim_before_cliff_is_zero() {
         let mut c = VestingContract::new("admin", "treasury");
-        c.add_grant("alice", 1000, 1000, 1000, 200);
+        c.add_grant("admin", "alice", 1000, 1000, 1000, 200).unwrap();
         let claimed = c.claim("alice", 1100).expect("claim should not error");
         assert_eq!(claimed, 0);
         assert_eq!(c.balance_of("alice"), 0);
@@ -368,7 +378,7 @@ mod tests {
     #[test]
     fn claim_after_cliff_partial() {
         let mut c = VestingContract::new("admin", "treasury");
-        c.add_grant("bob", 1000, 1000, 1000, 100);
+        c.add_grant("admin", "bob", 1000, 1000, 1000, 100).unwrap();
         let claimed = c.claim("bob", 1200).expect("claim should not error");
         assert_eq!(claimed, 200);
         assert_eq!(c.balance_of("bob"), 200);
@@ -378,7 +388,7 @@ mod tests {
     #[test]
     fn revoke_claws_unvested_to_treasury() {
         let mut c = VestingContract::new("admin", "treasury");
-        c.add_grant("carol", 1000, 1000, 1000, 100);
+        c.add_grant("admin", "carol", 1000, 1000, 1000, 100).unwrap();
         let _ = c.claim("carol", 1200).expect("claim should not error");
         assert_eq!(c.balance_of("contract"), 800);
         let transferred = c.revoke("admin", "carol", 1200).expect("revoke failed");
@@ -391,7 +401,7 @@ mod tests {
     #[test]
     fn revoke_only_admin() {
         let mut c = VestingContract::new("admin", "treasury");
-        c.add_grant("dan", 500, 0, 100, 0);
+        c.add_grant("admin", "dan", 500, 0, 100, 0).unwrap();
         let res = c.revoke("not-admin", "dan", 10);
         assert_eq!(res, Err(VestingError::Unauthorized));
         assert_eq!(c.total_locked(), 500);
@@ -400,6 +410,9 @@ mod tests {
 
 #[cfg(test)]
 mod pause_test;
+
+#[cfg(test)]
+mod cliff_bound_test;
 
 #[cfg(test)]
 mod vested_at_proptest;
