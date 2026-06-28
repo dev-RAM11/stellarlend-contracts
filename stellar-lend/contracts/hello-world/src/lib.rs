@@ -73,6 +73,8 @@ mod rate_clamp_test;
 mod twap_view_test;
 #[cfg(test)]
 mod twap_maxbuffer_perf_test;
+#[cfg(test)]
+mod twap_coverage_test;
 
 // Legacy test suite currently mismatches contract API and is excluded from CI compile.
 // #[cfg(test)]
