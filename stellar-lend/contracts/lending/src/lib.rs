@@ -69,6 +69,8 @@ mod liquidation_bonus_proptest;
 #[cfg(test)]
 mod liquidation_sequence_invariant_test;
 #[cfg(test)]
+mod max_borrow_proptest;
+#[cfg(test)]
 mod oracle_payload_binding_test;
 #[cfg(test)]
 mod oracle_staleness_test;
