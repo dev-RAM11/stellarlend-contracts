@@ -69,6 +69,8 @@ mod liquidation_bonus_proptest;
 #[cfg(test)]
 mod mul_div_proptest;
 #[cfg(test)]
+mod liquidation_branch_test;
+#[cfg(test)]
 mod liquidation_sequence_invariant_test;
 #[cfg(test)]
 mod oracle_payload_binding_test;
