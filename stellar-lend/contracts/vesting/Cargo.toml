@@ -8,7 +8,13 @@ name = "stellarlend_vesting"
 crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
-[dependencies]
+
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+
+[features]
+testutils = ["soroban-sdk/testutils"]
 
 [dev-dependencies]
 proptest = { workspace = true }

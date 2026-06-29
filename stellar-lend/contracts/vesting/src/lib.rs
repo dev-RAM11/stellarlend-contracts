@@ -732,3 +732,6 @@ mod vesting_views_test;
 
 #[cfg(test)]
 mod lifecycle_e2e_test;
+
+#[cfg(test)]
+mod milestone_schedule_test;
