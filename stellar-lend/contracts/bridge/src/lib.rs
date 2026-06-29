@@ -54,6 +54,8 @@ pub enum BridgeError {
     AlreadyPaused,
     /// The validator requested for unpause was not in the paused set.
     NotPaused,
+    /// Emitted when an outbound admission would exceed the configured cap.
+    OutboundCapExceeded,
 }
 
 impl std::fmt::Display for BridgeError {
@@ -95,6 +97,9 @@ impl std::fmt::Display for BridgeError {
             ),
             BridgeError::AlreadyPaused => write!(f, "AlreadyPaused: validator is already paused"),
             BridgeError::NotPaused => write!(f, "NotPaused: validator is not currently paused"),
+            BridgeError::OutboundCapExceeded => {
+                write!(f, "OutboundCapExceeded: outbound admission would exceed the configured cap")
+            }
         }
     }
 }
@@ -227,10 +232,23 @@ pub struct Bridge {
     /// rejected with [`BridgeError::NoGuardianConfigured`] until a guardian is
     /// configured via [`Bridge::set_guardian`].
     pub guardian: Option<PublicKey>,
+    /// Maximum cumulative outbound value that may be admitted within a single
+    /// rolling window. Behaves like `max_per_window` for inbound: `0` means
+    /// fail-closed until `set_outbound_cap` is called with a positive value.
+    pub max_outbound_per_window: i128,
+    /// Length of the rolling outbound-value window, in ledger-time seconds.
+    pub outbound_window_size: u64,
+    /// Ledger time at which the current outbound window began.
+    pub outbound_window_start: u64,
+    /// Cumulative outbound value admitted so far within
+    /// `[outbound_window_start, outbound_window_start + outbound_window_size)`.
+    pub window_outbound_total: i128,
 }
 
 /// Default rolling window length: one day, in seconds.
 pub const DEFAULT_INBOUND_WINDOW_SECS: u64 = 86_400;
+/// Default rolling window length for outbound caps: one day, in seconds.
+pub const DEFAULT_OUTBOUND_WINDOW_SECS: u64 = 86_400;
 
 /// Domain separator tags prepended to guardian-signed payloads for
 /// pause / unpause authorisations. Binding the tag into the signed payload
@@ -258,6 +276,10 @@ impl Bridge {
             window_inbound_total: 0,
             paused_validators: HashSet::new(),
             guardian: None,
+            max_outbound_per_window: 0,
+            outbound_window_size: DEFAULT_OUTBOUND_WINDOW_SECS,
+            outbound_window_start: 0,
+            window_outbound_total: 0,
         }
     }
 
@@ -599,6 +621,27 @@ impl Bridge {
         Ok(())
     }
 
+    /// Reconfigure the per-window outbound value cap and (re)start the
+    /// outbound window fresh at `current_time`.
+    ///
+    /// `max_per_window == 0` is a valid, intentional configuration meaning
+    /// "no outbound" (fail-closed) — use a positive value to actually permit
+    /// outbound transfers. `window_size` must be greater than zero.
+    pub fn set_outbound_cap(&mut self, max_per_window: i128, window_size: u64, current_time: u64) -> Result<()> {
+        if max_per_window < 0 {
+            return Err(anyhow!("max_per_window must be >= 0"));
+        }
+        if window_size == 0 {
+            return Err(BridgeError::InvalidWindowSize.into());
+        }
+
+        self.max_outbound_per_window = max_per_window;
+        self.outbound_window_size = window_size;
+        self.outbound_window_start = current_time;
+        self.window_outbound_total = 0;
+        Ok(())
+    }
+
     /// Roll the inbound-value window forward if `current_time` has moved
     /// past the end of the current window. Resetting realigns the window to
     /// start at `current_time` rather than stepping forward in fixed
@@ -615,6 +658,22 @@ impl Bridge {
             if current_time >= window_end {
                 self.window_start = current_time;
                 self.window_inbound_total = 0;
+            }
+        }
+    }
+
+    /// Roll the outbound-value window forward if `current_time` has moved
+    /// past the end of the current outbound window. Independent from the
+    /// inbound window so outbound activity cannot affect inbound accounting.
+    fn roll_outbound_window_if_expired(&mut self, current_time: u64) {
+        if current_time < self.outbound_window_start {
+            return;
+        }
+
+        if let Some(window_end) = self.outbound_window_start.checked_add(self.outbound_window_size) {
+            if current_time >= window_end {
+                self.outbound_window_start = current_time;
+                self.window_outbound_total = 0;
             }
         }
     }
@@ -654,6 +713,36 @@ impl Bridge {
         }
 
         self.window_inbound_total = new_total;
+        Ok(())
+    }
+
+    /// Admit an outbound transfer of `amount` against the per-window outbound
+    /// value cap, tracked on rolling ledger time. See `admit_inbound` for
+    /// the symmetric inbound behaviour: this function fails-closed when the
+    /// cap is configured as `0`, rejects negative amounts, rejects overflow
+    /// on the running total, and rejects attempts that would exceed the
+    /// configured outbound cap.
+    pub fn admit_outbound(&mut self, amount: i128, current_time: u64) -> Result<()> {
+        if amount < 0 {
+            return Err(anyhow!("outbound amount must be >= 0"));
+        }
+
+        if self.max_outbound_per_window == 0 {
+            return Err(anyhow!(BridgeError::OutboundCapExceeded));
+        }
+
+        self.roll_outbound_window_if_expired(current_time);
+
+        let new_total = self
+            .window_outbound_total
+            .checked_add(amount)
+            .ok_or_else(|| anyhow!("outbound window total overflow"))?;
+
+        if new_total > self.max_outbound_per_window {
+            return Err(BridgeError::OutboundCapExceeded.into());
+        }
+
+        self.window_outbound_total = new_total;
         Ok(())
     }
 }
@@ -697,6 +786,9 @@ mod window_guard_test;
 
 #[cfg(test)]
 mod window_tuning_doc_test;
+
+#[cfg(test)]
+mod outbound_cap_test;
 
 #[cfg(test)]
 mod validatorset_proptest;
