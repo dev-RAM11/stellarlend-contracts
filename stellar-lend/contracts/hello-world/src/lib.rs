@@ -61,6 +61,8 @@ mod twap_tests;
 
 #[cfg(test)]
 mod bridge_fee_test;
+#[cfg(test)]
+mod bridge_freeze_test;
 
 #[cfg(test)]
 mod amm_integration_test;
